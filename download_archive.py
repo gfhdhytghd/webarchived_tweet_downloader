@@ -323,6 +323,24 @@ ARCHIVE_JS = """
   });
 })();
 """
+INDEX_PAGE_CSS = """
+:root{--bg:#f4efe6;--paper:rgba(255,255,255,.82);--ink:#1c1a18;--muted:#6e6257;--line:rgba(28,26,24,.12);--accent:#b44f2c;--accent-2:#274690;--shadow:0 24px 60px rgba(37,29,22,.12)}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);font-family:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;background:radial-gradient(circle at top left,rgba(180,79,44,.2),transparent 32%),radial-gradient(circle at top right,rgba(39,70,144,.16),transparent 28%),linear-gradient(180deg,#f9f5ef 0%,var(--bg) 48%,#efe4d4 100%)}
+main{max-width:1080px;margin:0 auto;padding:56px 24px 72px}
+.hero{padding:28px 0 24px}
+.kicker{display:inline-block;margin-bottom:14px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;color:var(--accent-2);background:rgba(255,255,255,.55);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+h1{margin:0;font-size:clamp(36px,8vw,72px);line-height:.95;letter-spacing:-.04em}
+.lead{max-width:760px;margin:18px 0 0;color:var(--muted);font-size:clamp(18px,2.4vw,24px);line-height:1.5}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;margin-top:34px}
+.card{display:block;min-height:220px;padding:22px;border:1px solid var(--line);border-radius:24px;background:var(--paper);box-shadow:var(--shadow);text-decoration:none;color:inherit;backdrop-filter:blur(10px);transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
+.card:hover{transform:translateY(-4px);box-shadow:0 28px 70px rgba(37,29,22,.18);border-color:rgba(180,79,44,.35)}
+.eyebrow{display:inline-block;color:var(--accent);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+.card h2{margin:14px 0 12px;font-size:28px;line-height:1.02}
+.card p{margin:0;color:var(--muted);line-height:1.6}
+.footer{margin-top:26px;color:var(--muted);font-size:14px}
+@media (max-width:640px){main{padding:28px 16px 40px}.card{min-height:unset}}
+"""
 
 
 @dataclass(frozen=True)
@@ -1098,6 +1116,71 @@ def render_document_end(asset_dir_name: str) -> str:
     return f"  <script src='{html.escape(asset_dir_name)}/archive.js'></script>\n</div>\n</body>\n</html>"
 
 
+def render_index_document(user: str, total: int, output_path: Path) -> str:
+    title = f"{user} Archive"
+    tweet_word = "tweet" if total == 1 else "tweets"
+    cards = [
+        (output_path.name, "Chronological", "Browse the archive from oldest to newest."),
+        (f"{output_path.stem}_time_desc{output_path.suffix}", "Time Desc", "Browse the archive from newest to oldest."),
+        (
+            f"{output_path.stem}_media_first_time_desc{output_path.suffix}",
+            "Media First",
+            "Show posts with images first, then sort by newest first.",
+        ),
+        (
+            f"{output_path.stem}_text_length_desc{output_path.suffix}",
+            "Longest Text",
+            "Sort by visible post text length from longest to shortest.",
+        ),
+        (
+            f"{output_path.stem}_text_entropy_desc{output_path.suffix}",
+            "Highest Entropy",
+            "Sort by visible text character entropy from highest to lowest.",
+        ),
+    ]
+    card_html = "\n".join(
+        (
+            f"      <a class='card' href='{html.escape(href)}'>\n"
+            f"        <span class='eyebrow'>{html.escape(title)}</span>\n"
+            f"        <h2>{html.escape(label)}</h2>\n"
+            f"        <p>{html.escape(description)}</p>\n"
+            "      </a>"
+        )
+        for href, label, description in cards
+    )
+    lead = f"{total} archived {tweet_word} with five linked views for quick browsing and publishing."
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang='en'>\n"
+        "<head>\n"
+        "<meta charset='UTF-8'>\n"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+        f"<title>{html.escape(title)}</title>\n"
+        f"<style>{INDEX_PAGE_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<main>\n"
+        "  <section class='hero'>\n"
+        "    <span class='kicker'>Wayback Archive</span>\n"
+        f"    <h1>{html.escape(title)}</h1>\n"
+        f"    <p class='lead'>{html.escape(lead)}</p>\n"
+        "  </section>\n"
+        "  <section class='grid'>\n"
+        f"{card_html}\n"
+        "  </section>\n"
+        "  <p class='footer'>This index is generated automatically. Shared JSON and media assets stay under the archive assets folder.</p>\n"
+        "</main>\n"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def write_index_html(user: str, total: int, output_path: Path) -> Path:
+    index_path = output_path.with_name("index.html")
+    index_path.write_text(render_index_document(user, total, output_path), encoding="utf-8")
+    return index_path
+
+
 def write_archive_html(
     entries: List[ArchiveEntry],
     user: str,
@@ -1136,6 +1219,7 @@ def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_pat
     for mode, title_suffix, target in jobs:
         write_archive_html(sort_entries(entries, mode), user, target, asset_dir_name, title_suffix)
         written_paths.append(target)
+    written_paths.append(write_index_html(user, len(entries), output_path))
     return written_paths
 
 
