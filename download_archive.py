@@ -67,6 +67,95 @@ MAX_WORKERS = 12
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 REQUEST_ATTEMPTS = 4
+ARCHIVE_CSS = """
+:root{--bg:#f6f1ea;--paper:rgba(255,253,249,.9);--ink:#1d1b18;--muted:#6a6158;--line:rgba(29,27,24,.12);--accent:#9f4323;--accent-soft:rgba(159,67,35,.08);--shadow:0 20px 50px rgba(36,29,22,.08)}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;color:var(--ink);font-family:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;background:radial-gradient(circle at top left,rgba(159,67,35,.16),transparent 28%),radial-gradient(circle at top right,rgba(25,61,109,.12),transparent 24%),linear-gradient(180deg,#fbf8f2 0%,var(--bg) 46%,#efe3d4 100%)}
+.archive-shell{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+.archive-header{padding:4px 0 22px}
+.archive-badge{display:inline-block;margin-bottom:14px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+.archive-title{margin:0;font-size:clamp(32px,7vw,64px);line-height:.96;letter-spacing:-.04em}
+.archive-subtitle{margin:14px 0 0;max-width:760px;color:var(--muted);font-size:clamp(16px,2.6vw,20px);line-height:1.6}
+.tweet{margin-bottom:16px;padding:18px 18px 8px;border:1px solid var(--line);border-radius:24px;background:var(--paper);box-shadow:var(--shadow)}
+h3{margin:0;color:var(--muted);font-size:1rem}
+p{margin:10px 0;color:var(--ink);line-height:1.72;overflow-wrap:anywhere}
+.tweet p:last-child{margin-bottom:8px}
+.tweet-media{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
+.tweet-media-item{width:min(100%,420px)}
+.tweet-media-item img{display:block;width:100%;max-width:100%;height:auto;border-radius:16px;border:1px solid var(--line);box-shadow:0 16px 36px rgba(36,29,22,.1);cursor:zoom-in;background:#fff;transition:transform .16s ease,box-shadow .16s ease}
+.tweet-media-item img:hover,.tweet-media-item img:focus{transform:translateY(-1px);box-shadow:0 20px 44px rgba(36,29,22,.16);outline:none}
+a{color:#1d4f9d}
+.lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(14,12,11,.88)}
+.lightbox.is-open{display:flex}
+.lightbox-backdrop{position:absolute;inset:0}
+.lightbox-dialog{position:relative;z-index:1;max-width:min(100vw - 32px,1400px);max-height:min(100vh - 32px,1000px);display:flex;align-items:center;justify-content:center}
+.lightbox-image{display:block;max-width:100%;max-height:calc(100vh - 32px);border-radius:18px;box-shadow:0 28px 90px rgba(0,0,0,.42);background:#111}
+.lightbox-close{position:absolute;top:10px;right:10px;z-index:2;border:0;border-radius:999px;padding:10px 12px;background:rgba(255,255,255,.14);color:#fff;font:inherit;cursor:pointer}
+body.lightbox-open{overflow:hidden}
+@media (max-width:720px){.archive-shell{padding:14px 10px 40px}.tweet{padding:14px 14px 6px;border-radius:18px}.tweet-media{gap:10px}.tweet-media-item{width:100%}.lightbox{padding:12px}.lightbox-dialog{max-width:100%;max-height:100%}.lightbox-image{max-height:calc(100vh - 24px);border-radius:14px}.lightbox-close{top:8px;right:8px}}
+"""
+ARCHIVE_JS = """
+(() => {
+  const images = Array.from(document.querySelectorAll(".tweet-media-item img"));
+  if (!images.length) return;
+
+  const lightbox = document.createElement("div");
+  lightbox.className = "lightbox";
+  lightbox.setAttribute("aria-hidden", "true");
+  lightbox.innerHTML = `
+    <div class="lightbox-backdrop" data-lightbox-close></div>
+    <div class="lightbox-dialog" role="dialog" aria-modal="true" aria-label="Image preview">
+      <button class="lightbox-close" type="button" aria-label="Close image preview" data-lightbox-close>Close</button>
+      <img class="lightbox-image" alt="" />
+    </div>
+  `;
+  document.body.appendChild(lightbox);
+
+  const lightboxImage = lightbox.querySelector(".lightbox-image");
+  const closeTargets = lightbox.querySelectorAll("[data-lightbox-close]");
+
+  function closeLightbox() {
+    lightbox.classList.remove("is-open");
+    lightbox.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("lightbox-open");
+    lightboxImage.removeAttribute("src");
+    lightboxImage.alt = "";
+  }
+
+  function openLightbox(image) {
+    lightboxImage.src = image.currentSrc || image.src;
+    lightboxImage.alt = image.alt || "";
+    lightbox.classList.add("is-open");
+    lightbox.setAttribute("aria-hidden", "false");
+    document.body.classList.add("lightbox-open");
+  }
+
+  closeTargets.forEach((target) => {
+    target.addEventListener("click", closeLightbox);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && lightbox.classList.contains("is-open")) {
+      closeLightbox();
+    }
+  });
+
+  images.forEach((image) => {
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.tabIndex = 0;
+    image.setAttribute("role", "button");
+    image.addEventListener("click", () => openLightbox(image));
+    image.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openLightbox(image);
+      }
+    });
+  });
+})();
+"""
 
 
 def get_session() -> requests.Session:
@@ -376,7 +465,7 @@ def render_snapshot_entry(snapshot: Tuple[str, str]) -> str:
         if not data_url:
             continue
         media_html_parts.append(
-            f"  <div class='tweet-media-item'><img src='{data_url}' alt='Archived media from tweet captured on {html.escape(dt)}'/></div>\n"
+            f"  <div class='tweet-media-item'><img src='{data_url}' alt='Archived media from tweet captured on {html.escape(dt)}' loading='lazy' decoding='async'/></div>\n"
         )
 
     media_html = ""
@@ -386,6 +475,35 @@ def render_snapshot_entry(snapshot: Tuple[str, str]) -> str:
     return (
         f"<div class='tweet'>\n  <h3>{dt}</h3>\n{text_html}{media_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
     )
+
+
+def render_document_start(user: str, total: int) -> str:
+    title = f"Archived tweets of @{user}"
+    tweet_word = "tweet" if total == 1 else "tweets"
+    subtitle = (
+        f"{total} archived {tweet_word}. Mobile-friendly layout with tap-to-zoom images built in."
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang='en'>\n"
+        "<head>\n"
+        "<meta charset='UTF-8'>\n"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+        f"<title>{html.escape(title)}</title>\n"
+        f"<style>{ARCHIVE_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<div class='archive-shell'>\n"
+        "  <header class='archive-header'>\n"
+        "    <span class='archive-badge'>Wayback Archive</span>\n"
+        f"    <h1 class='archive-title'>{html.escape(title)}</h1>\n"
+        f"    <p class='archive-subtitle'>{html.escape(subtitle)}</p>\n"
+        "  </header>\n"
+    )
+
+
+def render_document_end() -> str:
+    return f"  <script>{ARCHIVE_JS}</script>\n</div>\n</body>\n</html>"
 
 
 def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> None:
@@ -402,16 +520,7 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
         Path where the HTML file will be written.
     """
     with open(outfile, "w", encoding="utf-8") as f:
-        f.write("<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='UTF-8'>\n")
-        f.write(f"<title>Archived tweets of @{html.escape(user)}</title>\n")
-        f.write("<style>body{font-family:Arial, sans-serif;margin:40px;background-color:#f9f9f9;}"
-                "h1{color:#333;} .tweet{border-bottom:1px solid #ccc;padding:15px 0;}"
-                "h3{margin:0;color:#555;font-size:1.1em;} p{margin:8px 0;color:#222;}"
-                ".tweet-media{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0;}"
-                ".tweet-media-item{max-width:min(100%, 420px);}"
-                ".tweet-media-item img{display:block;max-width:100%;height:auto;border-radius:8px;border:1px solid #ddd;}"
-                "a{color:#1a0dab;}\n</style>\n</head>\n<body>\n")
-        f.write(f"<h1>Archived tweets of @{html.escape(user)}</h1>\n")
+        f.write(render_document_start(user, len(snapshots)))
         total = len(snapshots)
         next_to_submit = 0
         next_to_write = 0
@@ -448,7 +557,7 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
                         print(f"Processed {next_to_write}/{total} archived tweets...", flush=True)
                         f.flush()
 
-        f.write("</body>\n</html>")
+        f.write(render_document_end())
         f.flush()
 
 

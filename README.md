@@ -8,6 +8,7 @@ The exporter:
 - fetches archived tweet JSON payloads
 - extracts tweet text from several Twitter payload shapes
 - downloads tweet images and embeds them into the output HTML as `data:` URLs
+- writes a mobile-friendly archive page with built-in image tap-to-zoom
 
 ## Requirements
 
@@ -35,6 +36,30 @@ python download_archive.py AnIncandescence anincandescence_archive.html
 ```
 
 If `output_html` is omitted, the script writes to `<username>_archive.html`.
+
+The generated HTML now includes:
+
+- responsive mobile-friendly layout
+- larger card-style tweet blocks
+- clickable / tap-to-zoom images via a built-in lightbox
+- lazy-loaded embedded images
+
+## Reordering An Existing Archive
+
+You can also reorder an already-generated archive HTML without downloading data again:
+
+```bash
+python sort_archive_html.py path/to/account_archive.html
+```
+
+This writes four sibling files next to the input:
+
+- `*_time_desc.html`
+- `*_media_first_time_desc.html`
+- `*_text_length_desc.html`
+- `*_text_entropy_desc.html`
+
+The sorter preserves the existing HTML structure and only changes tweet order.
 
 ## What The Script Does
 
