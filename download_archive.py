@@ -75,6 +75,8 @@ CDX_BASE_URL = "https://web.archive.org/cdx/search/cdx"
 USER_AGENT = "Mozilla/5.0 (compatible; archive-exporter/1.0; +https://web.archive.org)"
 SESSION_LOCAL = threading.local()
 DEFAULT_MAX_WORKERS = 12
+DEFAULT_JSON_RETRY_PASSES = 3
+JSON_RETRY_BACKOFF_SECONDS = 2.0
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 REQUEST_ATTEMPTS = 4
@@ -256,13 +258,9 @@ p{margin:4px 0 0;font-size:15px;color:var(--ink);line-height:1.5;overflow-wrap:a
 .tweet-media-item img:hover{opacity:.88}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
-.lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.7)}
+.lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.7);cursor:pointer}
 .lightbox.is-open{display:flex}
-.lightbox-backdrop{position:absolute;inset:0}
-.lightbox-dialog{position:relative;z-index:1;max-width:min(100vw - 32px,1400px);max-height:min(100vh - 32px,1000px);display:flex;align-items:center;justify-content:center}
-.lightbox-image{display:block;max-width:100%;max-height:calc(100vh - 32px);border-radius:12px;background:#000}
-.lightbox-close{position:absolute;top:8px;right:8px;z-index:2;width:36px;height:36px;border:0;border-radius:50%;padding:0;background:rgba(15,20,25,.75);color:#fff;font-size:18px;line-height:36px;text-align:center;cursor:pointer;backdrop-filter:blur(4px)}
-.lightbox-close:hover{background:rgba(15,20,25,.9)}
+.lightbox-image{display:block;max-width:min(100vw - 48px,1400px);max-height:calc(100vh - 48px);border-radius:12px;background:#000}
 body.lightbox-open{overflow:hidden}
 @media (max-width:600px){.archive-shell{border-left:none;border-right:none}.tweet{padding:10px 16px}.tweet-media{border-radius:12px}}
 """
@@ -274,17 +272,10 @@ ARCHIVE_JS = """
   const lightbox = document.createElement("div");
   lightbox.className = "lightbox";
   lightbox.setAttribute("aria-hidden", "true");
-  lightbox.innerHTML = `
-    <div class="lightbox-backdrop" data-lightbox-close></div>
-    <div class="lightbox-dialog" role="dialog" aria-modal="true" aria-label="Image preview">
-      <button class="lightbox-close" type="button" aria-label="Close image preview" data-lightbox-close>Close</button>
-      <img class="lightbox-image" alt="" />
-    </div>
-  `;
+  lightbox.innerHTML = `<img class="lightbox-image" alt="" />`;
   document.body.appendChild(lightbox);
 
   const lightboxImage = lightbox.querySelector(".lightbox-image");
-  const closeTargets = lightbox.querySelectorAll("[data-lightbox-close]");
 
   function closeLightbox() {
     lightbox.classList.remove("is-open");
@@ -302,9 +293,7 @@ ARCHIVE_JS = """
     document.body.classList.add("lightbox-open");
   }
 
-  closeTargets.forEach((target) => {
-    target.addEventListener("click", closeLightbox);
-  });
+  lightbox.addEventListener("click", closeLightbox);
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && lightbox.classList.contains("is-open")) {
@@ -536,6 +525,17 @@ def count_existing_snapshot_json(records: List[SnapshotRecord]) -> int:
         if record.json_path.exists() and load_snapshot_json(record.json_path) is not None:
             ready_count += 1
     return ready_count
+
+
+def split_ready_and_missing_snapshot_records(records: List[SnapshotRecord]) -> Tuple[List[SnapshotRecord], List[SnapshotRecord]]:
+    ready_records: List[SnapshotRecord] = []
+    missing_records: List[SnapshotRecord] = []
+    for record in records:
+        if record.json_path.exists() and load_snapshot_json(record.json_path) is not None:
+            ready_records.append(record)
+        else:
+            missing_records.append(record)
+    return ready_records, missing_records
 
 
 def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
@@ -1284,46 +1284,75 @@ def download_snapshot_records(
     if total == 0:
         return 0, 0
 
-    completed_count = 0
+    ready_records, missing_records = split_ready_and_missing_snapshot_records(records) if resume else ([], records[:])
     downloaded_count = 0
-    reused_count = count_existing_snapshot_json(records) if resume else 0
-    ready_count = reused_count
+    ready_count = len(ready_records)
 
-    if reused_count:
-        print(f"Reusing {reused_count}/{total} existing JSON snapshots...", flush=True)
+    if ready_count:
+        print(f"Reusing {ready_count}/{total} existing JSON snapshots...", flush=True)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {}
-        next_to_submit = 0
+    for pass_index in range(1, DEFAULT_JSON_RETRY_PASSES + 1):
+        if not missing_records:
+            break
 
-        while next_to_submit < total and len(pending) < workers * 4:
-            future = executor.submit(ensure_snapshot_json, records[next_to_submit], resume)
-            pending[future] = next_to_submit
-            next_to_submit += 1
+        if DEFAULT_JSON_RETRY_PASSES > 1:
+            print(
+                f"JSON fetch pass {pass_index}/{DEFAULT_JSON_RETRY_PASSES} for {len(missing_records)} unresolved snapshots...",
+                flush=True,
+            )
 
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                pending.pop(future)
-                completed_count += 1
-                try:
-                    status = future.result()
+        completed_count = 0
+        next_round_missing: List[SnapshotRecord] = []
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {}
+            next_to_submit = 0
+
+            while next_to_submit < len(missing_records) and len(pending) < workers * 4:
+                future = executor.submit(ensure_snapshot_json, missing_records[next_to_submit], False)
+                pending[future] = missing_records[next_to_submit]
+                next_to_submit += 1
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    record = pending.pop(future)
+                    completed_count += 1
+                    try:
+                        status = future.result()
+                    except Exception:
+                        status = "missing"
+
                     if status == "downloaded":
                         downloaded_count += 1
                         ready_count += 1
-                except Exception:
-                    pass
+                    elif status != "reused":
+                        next_round_missing.append(record)
 
-            while next_to_submit < total and len(pending) < workers * 4:
-                future = executor.submit(ensure_snapshot_json, records[next_to_submit], resume)
-                pending[future] = next_to_submit
-                next_to_submit += 1
+                while next_to_submit < len(missing_records) and len(pending) < workers * 4:
+                    future = executor.submit(ensure_snapshot_json, missing_records[next_to_submit], False)
+                    pending[future] = missing_records[next_to_submit]
+                    next_to_submit += 1
 
-            if completed_count % 25 == 0 or completed_count == total:
-                print(
-                    f"JSON ready: {ready_count}/{total} (downloaded this run: {downloaded_count})",
-                    flush=True,
-                )
+                if completed_count % 25 == 0 or completed_count == len(missing_records):
+                    print(
+                        f"JSON ready: {ready_count}/{total} (downloaded this run: {downloaded_count})",
+                        flush=True,
+                    )
+
+        missing_records = next_round_missing
+        if missing_records and pass_index < DEFAULT_JSON_RETRY_PASSES:
+            print(
+                f"Retrying {len(missing_records)}/{total} still-missing JSON snapshots after a short backoff...",
+                flush=True,
+            )
+            time.sleep(JSON_RETRY_BACKOFF_SECONDS * pass_index)
+
+    if missing_records:
+        print(
+            f"Still missing {len(missing_records)}/{total} JSON snapshots after {DEFAULT_JSON_RETRY_PASSES} passes.",
+            flush=True,
+        )
 
     return ready_count, total
 
@@ -1413,19 +1442,19 @@ def build_archives_from_snapshot_records(
                 pending[future] = next_to_submit
                 next_to_submit += 1
 
-                while next_to_finalize in completed:
-                    entry = completed.pop(next_to_finalize)
-                    if entry is not None:
-                        finalized_entries.append(entry)
-                        rendered_count += 1
-                    next_to_finalize += 1
-                    if (
-                        rendered_count != last_reported_rendered
-                        and rendered_count
-                        and (rendered_count % 25 == 0 or next_to_finalize == total)
-                    ):
-                        print(f"Rendered {rendered_count}/{total} archive entries...", flush=True)
-                        last_reported_rendered = rendered_count
+            while next_to_finalize in completed:
+                entry = completed.pop(next_to_finalize)
+                if entry is not None:
+                    finalized_entries.append(entry)
+                    rendered_count += 1
+                next_to_finalize += 1
+                if (
+                    rendered_count != last_reported_rendered
+                    and rendered_count
+                    and (rendered_count % 25 == 0 or next_to_finalize == total)
+                ):
+                    print(f"Rendered {rendered_count}/{total} archive entries...", flush=True)
+                    last_reported_rendered = rendered_count
 
     write_media_cache(asset_dir, image_cache)
     print(f"Archive entries rendered: {rendered_count}/{total}")
@@ -1531,10 +1560,26 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
 
     print(f"JSON snapshots ready: {ready_json_count}/{total}")
     print(f"JSON snapshots downloaded this run: {downloaded_json_count}")
-    print(f"Archive entries rendered: {rendered_count}/{total}")
     write_media_cache(asset_dir, image_cache)
-    write_archive_html(finalized_entries, user, output_path, asset_dir_name)
-    return [output_path] + write_additional_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
+
+    ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
+    if missing_records:
+        print(
+            f"Retrying {len(missing_records)}/{total} missing JSON snapshots before finalizing sorted outputs...",
+            flush=True,
+        )
+        download_snapshot_records(missing_records, workers, resume=False)
+        ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
+
+    print(f"Finalizing HTML from {len(ready_records)}/{total} available JSON snapshots...", flush=True)
+    return build_archives_from_snapshot_records(
+        ready_records,
+        user,
+        output_path,
+        asset_dir,
+        workers,
+        resume=resume,
+    )
 
 
 def positive_int(value: str) -> int:
