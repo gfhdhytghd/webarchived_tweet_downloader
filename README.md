@@ -59,6 +59,7 @@ The generated archive pages include:
 - larger card-style tweet blocks
 - clickable / tap-to-zoom images via a built-in lightbox
 - lazy-loaded external image assets
+- built-in toggles for hiding replies and reposts
 - hidden `data-*` reply metadata on each tweet block for later filtering
 
 The hidden metadata currently includes:
@@ -70,6 +71,7 @@ The hidden metadata currently includes:
 - `data-in-reply-to-screen-name`
 - `data-is-reply`
 - `data-is-thread-root`
+- `data-is-repost`
 - `data-json-path`
 
 Each JSON file is stored as one archived response per tweet capture, named with the capture timestamp and tweet id.

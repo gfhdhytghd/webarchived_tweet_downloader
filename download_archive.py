@@ -82,6 +82,150 @@ MIME_EXTENSION_MAP = {
     "image/svg+xml": ".svg",
 }
 IMAGE_CACHE_LOCK = threading.Lock()
+ARCHIVE_FILTER_CSS = """
+.archive-controls{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 22px}
+.archive-toggle{display:inline-flex;align-items:center;gap:12px;min-height:52px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(255,253,249,.82);box-shadow:var(--shadow);cursor:pointer;user-select:none}
+.archive-toggle-input{position:absolute;opacity:0;pointer-events:none}
+.archive-toggle-switch{position:relative;width:46px;height:28px;flex:0 0 auto;border-radius:999px;background:rgba(29,27,24,.18);transition:background .16s ease}
+.archive-toggle-switch::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 4px 10px rgba(36,29,22,.16);transition:transform .16s ease}
+.archive-toggle-input:checked+.archive-toggle-switch{background:var(--accent)}
+.archive-toggle-input:checked+.archive-toggle-switch::after{transform:translateX(18px)}
+.archive-toggle-label{font-size:.98rem;font-weight:600}
+.archive-toggle-meta{color:var(--muted);font-size:.92rem}
+@media (max-width:720px){.archive-controls{gap:10px;margin-bottom:18px}.archive-toggle{width:100%;justify-content:space-between;gap:10px;padding:10px 12px}}
+"""
+ARCHIVE_FILTER_JS = """
+(() => {
+  const TWEET_FILTERS = [
+    {
+      key: "reply",
+      label: "隐藏回复帖",
+      storageKey: `${getArchiveStorageNamespace()}-hide-replies`,
+      predicate: (tweet, firstSegment) => {
+        const meta = tweet.dataset.isReply;
+        if (meta === "true") return true;
+        if (meta === "false") return false;
+        return /^@\\S+/.test(firstSegment);
+      },
+    },
+    {
+      key: "repost",
+      label: "隐藏转贴",
+      storageKey: `${getArchiveStorageNamespace()}-hide-reposts`,
+      predicate: (tweet, firstSegment) => {
+        const meta = tweet.dataset.isRepost;
+        if (meta === "true") return true;
+        if (meta === "false") return false;
+        return /^RT\\s+@\\S+/i.test(firstSegment);
+      },
+    },
+  ];
+
+  setupTweetFilters();
+
+  function setupTweetFilters() {
+    const tweets = Array.from(document.querySelectorAll(".tweet"));
+    if (!tweets.length) return;
+
+    const classifiedFilters = TWEET_FILTERS.map((filter) => ({ ...filter, tweets: [] }));
+
+    tweets.forEach((tweet) => {
+      const body = tweet.querySelector("p");
+      const firstSegment = getFirstSegmentText(body);
+      classifiedFilters.forEach((filter) => {
+        const matches = filter.predicate(tweet, firstSegment);
+        tweet.classList.toggle(`tweet-is-${filter.key}`, matches);
+        if (matches) {
+          filter.tweets.push(tweet);
+        }
+      });
+    });
+
+    const activeFilters = classifiedFilters.filter((filter) => filter.tweets.length);
+    if (!activeFilters.length) return;
+
+    const controls = document.createElement("div");
+    controls.className = "archive-controls";
+    controls.innerHTML = activeFilters
+      .map(
+        (filter) => `
+          <label class="archive-toggle">
+            <input class="archive-toggle-input" type="checkbox" data-filter-key="${filter.key}" />
+            <span class="archive-toggle-switch" aria-hidden="true"></span>
+            <span class="archive-toggle-label">${filter.label}</span>
+            <span class="archive-toggle-meta">${filter.tweets.length} / ${tweets.length}</span>
+          </label>
+        `,
+      )
+      .join("");
+
+    const intro = document.querySelector(".archive-subtitle");
+    const shell = document.querySelector(".archive-shell");
+    if (!shell) return;
+    if (intro?.parentNode === shell) {
+      shell.insertBefore(controls, intro.nextSibling);
+    } else {
+      shell.insertBefore(controls, shell.firstChild);
+    }
+
+    activeFilters.forEach((filter) => {
+      const checkbox = controls.querySelector(`[data-filter-key="${filter.key}"]`);
+      if (!checkbox) return;
+      checkbox.checked = readFilterState(filter.storageKey);
+      checkbox.addEventListener("change", () => {
+        writeFilterState(filter.storageKey, checkbox.checked);
+        applyTweetFilters(tweets, activeFilters, controls);
+      });
+    });
+
+    applyTweetFilters(tweets, activeFilters, controls);
+  }
+
+  function getFirstSegmentText(body) {
+    if (!body) return "";
+    const [firstSegmentHtml = ""] = body.innerHTML.split(/<br\\s*\\/?>/i);
+    const scratch = document.createElement("div");
+    scratch.innerHTML = firstSegmentHtml;
+    return (scratch.textContent || "").trim();
+  }
+
+  function applyTweetFilters(tweets, filters, controls) {
+    const enabledFilters = new Set(
+      filters
+        .filter((filter) => controls.querySelector(`[data-filter-key="${filter.key}"]`)?.checked)
+        .map((filter) => filter.key),
+    );
+
+    tweets.forEach((tweet) => {
+      const shouldHide = filters.some(
+        (filter) => enabledFilters.has(filter.key) && tweet.classList.contains(`tweet-is-${filter.key}`),
+      );
+      tweet.hidden = shouldHide;
+    });
+  }
+
+  function getArchiveStorageNamespace() {
+    const file = (window.location.pathname.split("/").pop() || "archive.html").replace(/\\.html$/i, "");
+    return file.replace(/_(time_desc|media_first_time_desc|text_length_desc|text_entropy_desc)$/i, "");
+  }
+
+  function readFilterState(storageKey) {
+    try {
+      return window.localStorage.getItem(storageKey) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  function writeFilterState(storageKey, enabled) {
+    try {
+      window.localStorage.setItem(storageKey, enabled ? "1" : "0");
+    } catch {
+      // Ignore storage failures and keep the filter session-local.
+    }
+  }
+})();
+"""
 ARCHIVE_CSS = """
 :root{--bg:#f6f1ea;--paper:rgba(255,253,249,.9);--ink:#1d1b18;--muted:#6a6158;--line:rgba(29,27,24,.12);--accent:#9f4323;--accent-soft:rgba(159,67,35,.08);--shadow:0 20px 50px rgba(36,29,22,.08)}
 *{box-sizing:border-box}
@@ -212,8 +356,8 @@ def ensure_static_files(asset_dir: Path) -> None:
     asset_dir.mkdir(parents=True, exist_ok=True)
     (asset_dir / "media").mkdir(parents=True, exist_ok=True)
     (asset_dir / "json").mkdir(parents=True, exist_ok=True)
-    (asset_dir / "archive.css").write_text(ARCHIVE_CSS, encoding="utf-8")
-    (asset_dir / "archive.js").write_text(ARCHIVE_JS, encoding="utf-8")
+    (asset_dir / "archive.css").write_text(ARCHIVE_CSS + "\n" + ARCHIVE_FILTER_CSS, encoding="utf-8")
+    (asset_dir / "archive.js").write_text(ARCHIVE_FILTER_JS + "\n" + ARCHIVE_JS, encoding="utf-8")
 
 
 def sort_entries(entries: List[ArchiveEntry], mode: str) -> List[ArchiveEntry]:
@@ -444,12 +588,22 @@ def _extract_metadata_from_node(node: dict) -> Dict[str, str]:
     in_reply_to_screen_name = _coerce_string(
         node.get("in_reply_to_screen_name") or legacy.get("in_reply_to_screen_name")
     )
+    text = _extract_tweet_text_from_node(node)
+    is_repost = "true" if (
+        "retweeted_status_result" in node
+        or "retweeted_status" in node
+        or "retweeted_status_result" in legacy
+        or "retweeted_status" in legacy
+        or _coerce_string(node.get("retweeted_status_id_str") or legacy.get("retweeted_status_id_str"))
+        or text.startswith("RT @")
+    ) else "false"
     return {
         "tweet_id": tweet_id,
         "conversation_id": conversation_id,
         "in_reply_to_status_id": in_reply_to_status_id,
         "in_reply_to_user_id": in_reply_to_user_id,
         "in_reply_to_screen_name": in_reply_to_screen_name,
+        "is_repost": is_repost,
     }
 
 
@@ -488,6 +642,7 @@ def extract_tweet_metadata(data: dict, original_url: str) -> Dict[str, str]:
         "in_reply_to_status_id": "",
         "in_reply_to_user_id": "",
         "in_reply_to_screen_name": "",
+        "is_repost": "false",
     }
 
     is_reply = "unknown"
@@ -619,6 +774,7 @@ def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: st
         "data-in-reply-to-screen-name": metadata.get("in_reply_to_screen_name", ""),
         "data-is-reply": metadata.get("is_reply", "unknown"),
         "data-is-thread-root": metadata.get("is_thread_root", "unknown"),
+        "data-is-repost": metadata.get("is_repost", "false"),
         "data-json-path": json_relative_path,
     }
     rendered = []
