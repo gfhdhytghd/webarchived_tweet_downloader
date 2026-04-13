@@ -57,24 +57,24 @@ python download_archive.py AnIncandescence --json-only --workers 24
 python download_archive.py AnIncandescence --html-from-json
 ```
 
-The script always writes the base archive to `<username>_archive.html`.
+The script always writes everything into a dedicated `<username>_archive/` folder.
 
 ## Output Layout
 
 For a user like `AnIncandescence`, the downloader writes:
 
-- `index.html`
-- `AnIncandescence_archive.html`
-- `AnIncandescence_archive_time_desc.html`
-- `AnIncandescence_archive_media_first_time_desc.html`
-- `AnIncandescence_archive_text_length_desc.html`
-- `AnIncandescence_archive_text_entropy_desc.html`
-- `AnIncandescence_archive_assets/archive.css`
-- `AnIncandescence_archive_assets/archive.js`
-- `AnIncandescence_archive_assets/media/...`
-- `AnIncandescence_archive_assets/json/...`
-- `AnIncandescence_archive_assets/snapshots.json`
-- `AnIncandescence_archive_assets/media_index.json`
+- `AnIncandescence_archive/index.html`
+- `AnIncandescence_archive/AnIncandescence_archive.html`
+- `AnIncandescence_archive/AnIncandescence_archive_time_desc.html`
+- `AnIncandescence_archive/AnIncandescence_archive_media_first_time_desc.html`
+- `AnIncandescence_archive/AnIncandescence_archive_text_length_desc.html`
+- `AnIncandescence_archive/AnIncandescence_archive_text_entropy_desc.html`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/archive.css`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/archive.js`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/media/...`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/json/...`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/snapshots.json`
+- `AnIncandescence_archive/AnIncandescence_archive_assets/media_index.json`
 
 The generated archive pages include:
 
@@ -116,11 +116,11 @@ The downloader also writes:
 
 ## Notes
 
-- The output is no longer self-contained in a single file; keep the HTML files together with the generated `*_archive_assets/` directory.
-- `index.html` is written into the current output directory as the default entry page for static hosting. If you generate multiple users into the same directory, the latest run will replace that `index.html`.
+- The output is no longer self-contained in a single file; keep each generated `<username>_archive/` directory intact.
+- `index.html` is written inside that per-user output directory as the default entry page for static hosting.
 - Resume is enabled by default. Existing valid JSON snapshots and downloaded media assets are reused automatically. Pass `--no-resume` to force re-fetching.
 - `--json-only` stops after the JSON stage and does not write HTML files.
-- `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `*_archive_assets/json/` directory.
+- `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `<username>_archive/*_archive_assets/json/` directory.
 - Wayback responses are inconsistent; some archived captures may still fail to parse.
 - The script retries transient network failures, but very large exports can still take a while.
 - The Internet Archive may throttle aggressive traffic. If necessary, rerun the command later.

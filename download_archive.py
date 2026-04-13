@@ -398,8 +398,9 @@ def ensure_static_files(asset_dir: Path) -> None:
 
 
 def build_output_paths(user: str) -> Tuple[Path, Path, Path, Path, str]:
-    output_path = Path(f"{user}_archive.html").resolve()
-    asset_dir = output_path.with_name(f"{output_path.stem}_assets")
+    output_dir = Path(f"{user}_archive").resolve()
+    output_path = output_dir / f"{user}_archive.html"
+    asset_dir = output_dir / f"{user}_archive_assets"
     media_dir = asset_dir / "media"
     json_dir = asset_dir / "json"
     return output_path, asset_dir, media_dir, json_dir, asset_dir.name
