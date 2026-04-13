@@ -530,6 +530,14 @@ def resolve_snapshot_records(
     return records, "remote"
 
 
+def count_existing_snapshot_json(records: List[SnapshotRecord]) -> int:
+    ready_count = 0
+    for record in records:
+        if record.json_path.exists() and load_snapshot_json(record.json_path) is not None:
+            ready_count += 1
+    return ready_count
+
+
 def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
     cache_path = media_index_path(asset_dir)
     if not cache_path.exists():
@@ -971,17 +979,17 @@ def write_snapshot_json(
     return f"{asset_dir_name}/json/{json_path.name}"
 
 
-def ensure_snapshot_json(record: SnapshotRecord, resume: bool = True) -> bool:
+def ensure_snapshot_json(record: SnapshotRecord, resume: bool = True) -> str:
     if resume and record.json_path.exists() and load_snapshot_json(record.json_path) is not None:
-        return True
+        return "reused"
 
     raw_json = fetch_snapshot_json(record.timestamp, record.original_url)
     if not raw_json:
-        return False
+        return "missing"
 
     record.json_path.parent.mkdir(parents=True, exist_ok=True)
     record.json_path.write_text(raw_json, encoding="utf-8")
-    return True
+    return "downloaded"
 
 
 def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: str) -> str:
@@ -1277,7 +1285,12 @@ def download_snapshot_records(
         return 0, 0
 
     completed_count = 0
-    available_count = 0
+    downloaded_count = 0
+    reused_count = count_existing_snapshot_json(records) if resume else 0
+    ready_count = reused_count
+
+    if reused_count:
+        print(f"Reusing {reused_count}/{total} existing JSON snapshots...", flush=True)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {}
@@ -1294,8 +1307,10 @@ def download_snapshot_records(
                 pending.pop(future)
                 completed_count += 1
                 try:
-                    if future.result():
-                        available_count += 1
+                    status = future.result()
+                    if status == "downloaded":
+                        downloaded_count += 1
+                        ready_count += 1
                 except Exception:
                     pass
 
@@ -1305,9 +1320,12 @@ def download_snapshot_records(
                 next_to_submit += 1
 
             if completed_count % 25 == 0 or completed_count == total:
-                print(f"Fetched {completed_count}/{total} JSON snapshots...", flush=True)
+                print(
+                    f"JSON ready: {ready_count}/{total} (downloaded this run: {downloaded_count})",
+                    flush=True,
+                )
 
-    return available_count, total
+    return ready_count, total
 
 
 def fetch_and_render_snapshot_entry(
@@ -1317,11 +1335,11 @@ def fetch_and_render_snapshot_entry(
     media_dir: Path,
     image_cache: Optional[Dict[str, str]] = None,
     resume: bool = True,
-) -> Tuple[bool, Optional[ArchiveEntry]]:
-    json_ready = ensure_snapshot_json(record, resume=resume)
-    if not json_ready:
-        return False, None
-    return True, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache)
+) -> Tuple[str, Optional[ArchiveEntry]]:
+    json_status = ensure_snapshot_json(record, resume=resume)
+    if json_status == "missing":
+        return json_status, None
+    return json_status, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache)
 
 
 def build_archives_from_snapshot_records(
@@ -1424,14 +1442,20 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
     image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
 
     total = len(records)
-    fetched_count = 0
+    reused_json_count = count_existing_snapshot_json(records) if resume else 0
+    ready_json_count = reused_json_count
+    downloaded_json_count = 0
     next_to_submit = 0
     next_to_finalize = 0
-    last_reported_fetched = -1
+    last_reported_ready_json = -1
     rendered_count = 0
     last_reported_rendered = -1
     finalized_entries: List[ArchiveEntry] = []
-    completed: Dict[int, Tuple[bool, Optional[ArchiveEntry]]] = {}
+    completed: Dict[int, Tuple[str, Optional[ArchiveEntry]]] = {}
+
+    if reused_json_count:
+        print(f"Reusing {reused_json_count}/{total} existing JSON snapshots...", flush=True)
+    print("Rebuilding HTML from available JSON in chronological order...", flush=True)
 
     with output_path.open("w", encoding="utf-8") as base_file:
         base_file.write(render_document_start(user, total, asset_dir_name))
@@ -1475,9 +1499,10 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                     next_to_submit += 1
 
                 while next_to_finalize in completed:
-                    json_ready, entry = completed.pop(next_to_finalize)
-                    if json_ready:
-                        fetched_count += 1
+                    json_status, entry = completed.pop(next_to_finalize)
+                    if json_status == "downloaded":
+                        downloaded_json_count += 1
+                        ready_json_count += 1
                     if entry is not None:
                         base_file.write(entry.block)
                         base_file.flush()
@@ -1485,12 +1510,15 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                         rendered_count += 1
                     next_to_finalize += 1
                     if (
-                        fetched_count != last_reported_fetched
-                        and fetched_count
-                        and (fetched_count % 25 == 0 or fetched_count == total)
+                        ready_json_count != last_reported_ready_json
+                        and ready_json_count
+                        and (ready_json_count % 25 == 0 or next_to_finalize == total)
                     ):
-                        print(f"Fetched {fetched_count}/{total} JSON snapshots...", flush=True)
-                        last_reported_fetched = fetched_count
+                        print(
+                            f"JSON ready: {ready_json_count}/{total} (downloaded this run: {downloaded_json_count})",
+                            flush=True,
+                        )
+                        last_reported_ready_json = ready_json_count
                     if (
                         rendered_count != last_reported_rendered
                         and rendered_count
@@ -1501,7 +1529,8 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
 
         base_file.write(render_document_end(asset_dir_name))
 
-    print(f"JSON snapshots ready: {fetched_count}/{total}")
+    print(f"JSON snapshots ready: {ready_json_count}/{total}")
+    print(f"JSON snapshots downloaded this run: {downloaded_json_count}")
     print(f"Archive entries rendered: {rendered_count}/{total}")
     write_media_cache(asset_dir, image_cache)
     write_archive_html(finalized_entries, user, output_path, asset_dir_name)
@@ -1599,7 +1628,7 @@ def main():
             ensure_asset_directories(asset_dir)
             write_snapshot_manifest(asset_dir, user, records)
 
-            print(f"Found {len(records)} unique snapshots. Fetching JSON...")
+            print(f"Found {len(records)} snapshot records. Resolving JSON...")
             available_count, total = download_snapshot_records(records, args.workers, resume=resume)
             print(f"JSON snapshots ready: {available_count}/{total}")
             print("Finished JSON download stage.")
@@ -1607,7 +1636,7 @@ def main():
             print(f"  - {json_dir}")
             return
 
-        print(f"Found {len(snapshots)} unique snapshots. Fetching JSON and rendering HTML...")
+        print(f"Found {len(snapshots)} snapshot records. Resolving JSON and rendering HTML...")
         written_paths = build_archives(
             snapshots,
             user,
