@@ -1,4 +1,4 @@
-.codex/
+.codex
 __pycache__/
 *.pyc
 *.pyo
