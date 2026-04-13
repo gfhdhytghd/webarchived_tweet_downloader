@@ -31,10 +31,30 @@ Basic usage:
 python download_archive.py <twitter_username>
 ```
 
-Example:
+Fetch only JSON snapshots:
+
+```bash
+python download_archive.py <twitter_username> --json-only
+```
+
+Regenerate HTML from local JSON snapshots:
+
+```bash
+python download_archive.py <twitter_username> --html-from-json
+```
+
+Set a custom concurrency level:
+
+```bash
+python download_archive.py <twitter_username> --workers 24
+```
+
+Examples:
 
 ```bash
 python download_archive.py AnIncandescence
+python download_archive.py AnIncandescence --json-only --workers 24
+python download_archive.py AnIncandescence --html-from-json
 ```
 
 The script always writes the base archive to `<username>_archive.html`.
@@ -52,6 +72,8 @@ For a user like `AnIncandescence`, the downloader writes:
 - `AnIncandescence_archive_assets/archive.js`
 - `AnIncandescence_archive_assets/media/...`
 - `AnIncandescence_archive_assets/json/...`
+- `AnIncandescence_archive_assets/snapshots.json`
+- `AnIncandescence_archive_assets/media_index.json`
 
 The generated archive pages include:
 
@@ -76,18 +98,26 @@ The hidden metadata currently includes:
 
 Each JSON file is stored as one archived response per tweet capture, named with the capture timestamp and tweet id.
 
+The downloader also writes:
+
+- `snapshots.json`: manifest of timestamps, original tweet URLs, and expected JSON filenames
+- `media_index.json`: cache of downloaded media URLs to local asset paths for resume runs
+
 ## What The Script Does
 
 1. Calls the Wayback CDX API with a tweet URL prefix for the target account.
 2. Deduplicates captures by content digest when listing snapshots.
-3. Downloads archived tweet payloads with retry and backoff.
+3. Downloads archived tweet payloads with retry and backoff, or reuses local JSON files during resume runs.
 4. Extracts text from multiple Twitter response formats, including legacy and newer nested structures.
-5. Saves media, CSS, JS, and raw JSON into a shared asset folder.
+5. Saves media, CSS, JS, raw JSON, and manifest/cache files into a shared asset folder.
 6. Writes the main chronological archive plus four sorted HTML variants.
 
 ## Notes
 
 - The output is no longer self-contained in a single file; keep the HTML files together with the generated `*_archive_assets/` directory.
+- Resume is enabled by default. Existing valid JSON snapshots and downloaded media assets are reused automatically. Pass `--no-resume` to force re-fetching.
+- `--json-only` stops after the JSON stage and does not write HTML files.
+- `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `*_archive_assets/json/` directory.
 - Wayback responses are inconsistent; some archived captures may still fail to parse.
 - The script retries transient network failures, but very large exports can still take a while.
 - The Internet Archive may throttle aggressive traffic. If necessary, rerun the command later.

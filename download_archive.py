@@ -15,10 +15,14 @@ the chronological archive plus four sorted variants.
 Usage:
 
     python download_archive.py <twitter_username>
+    python download_archive.py <twitter_username> --json-only
+    python download_archive.py <twitter_username> --html-from-json
 
 Example:
 
     python download_archive.py AnIncandescence
+    python download_archive.py AnIncandescence --json-only --workers 24
+    python download_archive.py AnIncandescence --html-from-json
 
 Limitations:
 
@@ -42,6 +46,7 @@ Author: Assistant
 Date: April 13, 2026 (America/New_York)
 """
 
+import argparse
 import sys
 import hashlib
 import json
@@ -69,11 +74,12 @@ except ImportError:
 CDX_BASE_URL = "https://web.archive.org/cdx/search/cdx"
 USER_AGENT = "Mozilla/5.0 (compatible; archive-exporter/1.0; +https://web.archive.org)"
 SESSION_LOCAL = threading.local()
-MAX_WORKERS = 12
+DEFAULT_MAX_WORKERS = 12
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 REQUEST_ATTEMPTS = 4
 TWEET_URL_ID_RE = re.compile(r"/status/(\d+)")
+SNAPSHOT_FILENAME_RE = re.compile(r"^(?P<timestamp>\d{14})_(?P<tweet_id>.+)\.json$")
 MIME_EXTENSION_MAP = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -82,6 +88,8 @@ MIME_EXTENSION_MAP = {
     "image/svg+xml": ".svg",
 }
 IMAGE_CACHE_LOCK = threading.Lock()
+SNAPSHOT_MANIFEST_NAME = "snapshots.json"
+MEDIA_INDEX_NAME = "media_index.json"
 ARCHIVE_FILTER_CSS = """
 .archive-controls{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 22px}
 .archive-toggle{display:inline-flex;align-items:center;gap:12px;min-height:52px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(255,253,249,.82);box-shadow:var(--shadow);cursor:pointer;user-select:none}
@@ -330,6 +338,13 @@ class ArchiveEntry:
     index: int
 
 
+@dataclass(frozen=True)
+class SnapshotRecord:
+    timestamp: str
+    original_url: str
+    json_path: Path
+
+
 def normalize_text_for_entropy(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -352,12 +367,155 @@ def guess_extension(image_url: str, mime_type: str) -> str:
     return suffix if suffix else ".img"
 
 
-def ensure_static_files(asset_dir: Path) -> None:
+def ensure_asset_directories(asset_dir: Path) -> None:
     asset_dir.mkdir(parents=True, exist_ok=True)
     (asset_dir / "media").mkdir(parents=True, exist_ok=True)
     (asset_dir / "json").mkdir(parents=True, exist_ok=True)
+
+
+def ensure_static_files(asset_dir: Path) -> None:
+    ensure_asset_directories(asset_dir)
     (asset_dir / "archive.css").write_text(ARCHIVE_CSS + "\n" + ARCHIVE_FILTER_CSS, encoding="utf-8")
     (asset_dir / "archive.js").write_text(ARCHIVE_FILTER_JS + "\n" + ARCHIVE_JS, encoding="utf-8")
+
+
+def build_output_paths(user: str) -> Tuple[Path, Path, Path, Path, str]:
+    output_path = Path(f"{user}_archive.html").resolve()
+    asset_dir = output_path.with_name(f"{output_path.stem}_assets")
+    media_dir = asset_dir / "media"
+    json_dir = asset_dir / "json"
+    return output_path, asset_dir, media_dir, json_dir, asset_dir.name
+
+
+def snapshot_manifest_path(asset_dir: Path) -> Path:
+    return asset_dir / SNAPSHOT_MANIFEST_NAME
+
+
+def media_index_path(asset_dir: Path) -> Path:
+    return asset_dir / MEDIA_INDEX_NAME
+
+
+def parse_snapshot_filename(filename: str) -> Optional[Tuple[str, str]]:
+    match = SNAPSHOT_FILENAME_RE.match(filename)
+    if not match:
+        return None
+    return match.group("timestamp"), match.group("tweet_id")
+
+
+def reconstruct_original_url(user: str, tweet_id: str) -> str:
+    return f"https://twitter.com/{user}/status/{tweet_id}"
+
+
+def build_snapshot_records(snapshots: List[Tuple[str, str]], json_dir: Path) -> List[SnapshotRecord]:
+    records: List[SnapshotRecord] = []
+    for timestamp, original_url in snapshots:
+        json_path = build_json_output_path(json_dir, timestamp, original_url, {})
+        records.append(SnapshotRecord(timestamp=timestamp, original_url=original_url, json_path=json_path))
+    return records
+
+
+def write_snapshot_manifest(asset_dir: Path, user: str, records: List[SnapshotRecord]) -> None:
+    payload = {
+        "user": user,
+        "snapshots": [
+            {
+                "timestamp": record.timestamp,
+                "original_url": record.original_url,
+                "json_filename": record.json_path.name,
+            }
+            for record in records
+        ],
+    }
+    snapshot_manifest_path(asset_dir).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_snapshot_records(asset_dir: Path, json_dir: Path, user: str) -> List[SnapshotRecord]:
+    manifest = snapshot_manifest_path(asset_dir)
+    records: List[SnapshotRecord] = []
+
+    if manifest.exists():
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+
+        snapshots = payload.get("snapshots", []) if isinstance(payload, dict) else []
+        for item in snapshots:
+            if not isinstance(item, dict):
+                continue
+            timestamp = _coerce_string(item.get("timestamp")).strip()
+            original_url = _coerce_string(item.get("original_url")).strip()
+            json_filename = _coerce_string(item.get("json_filename")).strip()
+            if not json_filename:
+                continue
+            if not original_url:
+                parsed = parse_snapshot_filename(json_filename)
+                if not parsed:
+                    continue
+                _, tweet_id = parsed
+                original_url = reconstruct_original_url(user, tweet_id)
+            if not timestamp:
+                parsed = parse_snapshot_filename(json_filename)
+                if not parsed:
+                    continue
+                timestamp, _ = parsed
+            records.append(
+                SnapshotRecord(
+                    timestamp=timestamp,
+                    original_url=original_url,
+                    json_path=json_dir / json_filename,
+                )
+            )
+
+    if records:
+        return sorted(records, key=lambda record: (record.timestamp, record.original_url, record.json_path.name))
+
+    for json_path in sorted(json_dir.glob("*.json")):
+        parsed = parse_snapshot_filename(json_path.name)
+        if not parsed:
+            continue
+        timestamp, tweet_id = parsed
+        records.append(
+            SnapshotRecord(
+                timestamp=timestamp,
+                original_url=reconstruct_original_url(user, tweet_id),
+                json_path=json_path,
+            )
+        )
+    return records
+
+
+def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
+    cache_path = media_index_path(asset_dir)
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    cleaned: Dict[str, str] = {}
+    expected_prefix = f"{asset_dir_name}/media/"
+    for image_url, relative_path in payload.items():
+        if not isinstance(image_url, str) or not isinstance(relative_path, str):
+            continue
+        if not relative_path.startswith(expected_prefix):
+            continue
+        if (asset_dir / "media" / Path(relative_path).name).exists():
+            cleaned[image_url] = relative_path
+    return cleaned
+
+
+def write_media_cache(asset_dir: Path, cache: Dict[str, str]) -> None:
+    media_index_path(asset_dir).write_text(
+        json.dumps(dict(sorted(cache.items())), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def sort_entries(entries: List[ArchiveEntry], mode: str) -> List[ArchiveEntry]:
@@ -730,18 +888,24 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[str]
     return "\n".join(texts), deduped_image_urls, extract_tweet_metadata(data, original_url)
 
 
-def fetch_tweet_content(snapshot_timestamp: str, original_url: str) -> Tuple[str, List[str], Dict[str, str], str]:
+def fetch_snapshot_json(snapshot_timestamp: str, original_url: str) -> str:
     """
-    Retrieve the archived tweet JSON payload and extract text, media, and metadata.
+    Retrieve the archived tweet JSON payload as raw text and validate that it parses.
     """
     snapshot_url = f"https://web.archive.org/web/{snapshot_timestamp}id_/{original_url}"
     try:
         resp = get_with_retry(snapshot_url, timeout=JSON_TIMEOUT)
-        data = resp.json()
+        resp.json()
     except Exception:
-        return "", [], {}, ""
-    text, image_urls, metadata = extract_tweet_content(data, original_url)
-    return text, image_urls, metadata, resp.text
+        return ""
+    return resp.text
+
+
+def load_snapshot_json(json_path: Path) -> Optional[dict]:
+    try:
+        return json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def build_json_output_path(json_dir: Path, snapshot_timestamp: str, original_url: str, metadata: Dict[str, str]) -> Path:
@@ -763,6 +927,19 @@ def write_snapshot_json(
     json_path = build_json_output_path(json_dir, snapshot_timestamp, original_url, metadata)
     json_path.write_text(raw_json, encoding="utf-8")
     return f"{asset_dir_name}/json/{json_path.name}"
+
+
+def ensure_snapshot_json(record: SnapshotRecord, resume: bool = True) -> bool:
+    if resume and record.json_path.exists() and load_snapshot_json(record.json_path) is not None:
+        return True
+
+    raw_json = fetch_snapshot_json(record.timestamp, record.original_url)
+    if not raw_json:
+        return False
+
+    record.json_path.parent.mkdir(parents=True, exist_ok=True)
+    record.json_path.write_text(raw_json, encoding="utf-8")
+    return True
 
 
 def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: str) -> str:
@@ -795,7 +972,10 @@ def download_image_asset(
     """
     with IMAGE_CACHE_LOCK:
         if cache is not None and image_url in cache:
-            return cache[image_url]
+            cached_relative_path = cache[image_url]
+            if (media_dir / Path(cached_relative_path).name).exists():
+                return cached_relative_path
+            cache.pop(image_url, None)
 
     candidate_urls = [image_url, f"https://web.archive.org/web/{snapshot_timestamp}im_/{image_url}"]
     resp = None
@@ -828,41 +1008,39 @@ def download_image_asset(
 
 
 def render_snapshot_entry(
-    snapshot: Tuple[str, str],
+    record: SnapshotRecord,
     index: int,
     asset_dir_name: str,
     media_dir: Path,
-    json_dir: Path,
     image_cache: Optional[Dict[str, str]] = None,
 ) -> Optional[ArchiveEntry]:
     """
-    Fetch one archived tweet snapshot and render it as an archive entry.
+    Render one archived tweet snapshot from a local JSON file.
     """
-    timestamp, original_url = snapshot
     try:
-        dt_obj = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        dt_obj = datetime.strptime(record.timestamp, "%Y%m%d%H%M%S")
         dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S UTC")
     except ValueError:
         dt_obj = datetime.min
-        dt = timestamp
+        dt = record.timestamp
 
-    text, image_urls, metadata, raw_json = fetch_tweet_content(timestamp, original_url)
+    data = load_snapshot_json(record.json_path)
+    if data is None:
+        return None
+
+    text, image_urls, metadata = extract_tweet_content(data, record.original_url)
     if not text and not image_urls:
         return None
 
     safe_text = html.escape(text).replace("\n", "<br/>\n")
     text_html = f"  <p>{safe_text}</p>\n" if safe_text else ""
-    safe_url = html.escape(original_url)
-    json_relative_path = (
-        write_snapshot_json(json_dir, asset_dir_name, timestamp, original_url, metadata, raw_json)
-        if raw_json
-        else ""
-    )
+    safe_url = html.escape(record.original_url)
+    json_relative_path = f"{asset_dir_name}/json/{record.json_path.name}"
     tweet_attrs = build_tweet_data_attributes(metadata, json_relative_path)
 
     media_html_parts = []
     for image_url in image_urls:
-        image_path = download_image_asset(image_url, timestamp, media_dir, asset_dir_name, image_cache)
+        image_path = download_image_asset(image_url, record.timestamp, media_dir, asset_dir_name, image_cache)
         if not image_path:
             continue
         media_html_parts.append(
@@ -884,7 +1062,7 @@ def render_snapshot_entry(
         body_length=len(text),
         entropy=calculate_entropy(normalize_text_for_entropy(text)),
         has_media=bool(media_html_parts),
-        original_url=original_url,
+        original_url=record.original_url,
         index=index,
     )
 
@@ -961,44 +1139,92 @@ def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_pat
     return written_paths
 
 
-def build_archives(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> List[Path]:
+def download_snapshot_records(
+    records: List[SnapshotRecord],
+    workers: int,
+    resume: bool = True,
+) -> Tuple[int, int]:
+    total = len(records)
+    if total == 0:
+        return 0, 0
+
+    completed_count = 0
+    available_count = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        next_to_submit = 0
+
+        while next_to_submit < total and len(pending) < workers * 4:
+            future = executor.submit(ensure_snapshot_json, records[next_to_submit], resume)
+            pending[future] = next_to_submit
+            next_to_submit += 1
+
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future)
+                completed_count += 1
+                try:
+                    if future.result():
+                        available_count += 1
+                except Exception:
+                    pass
+
+            while next_to_submit < total and len(pending) < workers * 4:
+                future = executor.submit(ensure_snapshot_json, records[next_to_submit], resume)
+                pending[future] = next_to_submit
+                next_to_submit += 1
+
+            if completed_count % 25 == 0 or completed_count == total:
+                print(f"Fetched {completed_count}/{total} JSON snapshots...", flush=True)
+
+    return available_count, total
+
+
+def build_archives_from_snapshot_records(
+    records: List[SnapshotRecord],
+    user: str,
+    output_path: Path,
+    asset_dir: Path,
+    workers: int,
+    resume: bool = True,
+) -> List[Path]:
     """
-    Download archived tweets and write the base archive plus four sorted variants.
+    Render local snapshot JSON files into the base archive plus four sorted variants.
 
     Parameters
     ----------
-    snapshots : List[Tuple[str, str]]
-        List of (timestamp, original_url) pairs.
+    records : List[SnapshotRecord]
+        Snapshot metadata pointing at locally stored JSON files.
     user : str
         Twitter username.  Used for the title and header.
-    outfile : str
+    output_path : Path
         Path where the base chronological HTML file will be written.
+    asset_dir : Path
+        Directory containing shared CSS, JS, JSON, and media assets.
     """
-    output_path = Path(outfile).resolve()
-    asset_dir = output_path.with_name(f"{output_path.stem}_assets")
     ensure_static_files(asset_dir)
     media_dir = asset_dir / "media"
-    json_dir = asset_dir / "json"
     asset_dir_name = asset_dir.name
-    image_cache: Dict[str, str] = {}
+    image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
 
-    total = len(snapshots)
+    total = len(records)
     next_to_submit = 0
     next_to_finalize = 0
     finalized_entries: List[ArchiveEntry] = []
     completed: Dict[int, Optional[ArchiveEntry]] = {}
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         pending = {}
 
-        while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
+        while next_to_submit < total and len(pending) < workers * 4:
             future = executor.submit(
                 render_snapshot_entry,
-                snapshots[next_to_submit],
+                records[next_to_submit],
                 next_to_submit,
                 asset_dir_name,
                 media_dir,
-                json_dir,
                 image_cache,
             )
             pending[future] = next_to_submit
@@ -1013,14 +1239,13 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, outfile: str) ->
                 except Exception:
                     completed[index] = None
 
-            while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
+            while next_to_submit < total and len(pending) < workers * 4:
                 future = executor.submit(
                     render_snapshot_entry,
-                    snapshots[next_to_submit],
+                    records[next_to_submit],
                     next_to_submit,
                     asset_dir_name,
                     media_dir,
-                    json_dir,
                     image_cache,
                 )
                 pending[future] = next_to_submit
@@ -1031,25 +1256,116 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, outfile: str) ->
                 if entry is not None:
                     finalized_entries.append(entry)
                 next_to_finalize += 1
-                if next_to_finalize % 25 == 0:
+                if next_to_finalize % 25 == 0 or next_to_finalize == total:
                     print(f"Processed {next_to_finalize}/{total} archived tweets...", flush=True)
 
+    write_media_cache(asset_dir, image_cache)
     return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
 
 
+def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Path, asset_dir: Path, workers: int, resume: bool = True) -> List[Path]:
+    ensure_asset_directories(asset_dir)
+    records = build_snapshot_records(snapshots, asset_dir / "json")
+    write_snapshot_manifest(asset_dir, user, records)
+    available_count, total = download_snapshot_records(records, workers, resume=resume)
+    print(f"JSON snapshots ready: {available_count}/{total}")
+    return build_archives_from_snapshot_records(records, user, output_path, asset_dir, workers, resume=resume)
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download archived tweets into JSON and HTML archive bundles.",
+    )
+    parser.add_argument("twitter_username", help="Twitter/X username without the @ prefix")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Only fetch snapshot JSON files and update the local manifest.",
+    )
+    mode_group.add_argument(
+        "--html-from-json",
+        "--html-only",
+        dest="html_from_json",
+        action="store_true",
+        help="Skip snapshot JSON fetching and regenerate the HTML bundle from local JSON files.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=DEFAULT_MAX_WORKERS,
+        help=f"Maximum concurrent workers for JSON/media processing (default: {DEFAULT_MAX_WORKERS})",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not reuse existing JSON or media files; fetch them again when applicable.",
+    )
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python download_archive.py <twitter_username>")
-        sys.exit(1)
-    user = sys.argv[1].lstrip("@").strip()
-    outfile = f"{user}_archive.html"
-    print(f"Fetching list of archived tweets for @{user}...")
-    snapshots = fetch_snapshots(user)
-    if not snapshots:
-        print("No snapshots found or failed to retrieve list.")
-        sys.exit(1)
-    print(f"Found {len(snapshots)} unique snapshots. Downloading content...")
-    written_paths = build_archives(snapshots, user, outfile)
+    args = parse_args()
+    user = args.twitter_username.lstrip("@").strip()
+    resume = not args.no_resume
+    output_path, asset_dir, _, json_dir, _ = build_output_paths(user)
+
+    if args.html_from_json:
+        print(f"Loading local snapshot JSON for @{user}...")
+        records = load_snapshot_records(asset_dir, json_dir, user)
+        if not records:
+            print(f"No local JSON snapshots found in {json_dir}")
+            sys.exit(1)
+        available_records = [record for record in records if record.json_path.exists()]
+        if not available_records:
+            print(f"No JSON snapshot files are present in {json_dir}")
+            sys.exit(1)
+        print(f"Found {len(available_records)} local JSON snapshots. Rendering HTML...")
+        written_paths = build_archives_from_snapshot_records(
+            available_records,
+            user,
+            output_path,
+            asset_dir,
+            args.workers,
+            resume=resume,
+        )
+    else:
+        print(f"Fetching list of archived tweets for @{user}...")
+        snapshots = fetch_snapshots(user)
+        if not snapshots:
+            print("No snapshots found or failed to retrieve list.")
+            sys.exit(1)
+
+        if args.json_only:
+            ensure_asset_directories(asset_dir)
+            records = build_snapshot_records(snapshots, json_dir)
+            write_snapshot_manifest(asset_dir, user, records)
+
+            print(f"Found {len(records)} unique snapshots. Fetching JSON...")
+            available_count, total = download_snapshot_records(records, args.workers, resume=resume)
+            print(f"JSON snapshots ready: {available_count}/{total}")
+            print("Finished JSON download stage.")
+            print(f"  - {snapshot_manifest_path(asset_dir)}")
+            print(f"  - {json_dir}")
+            return
+
+        print(f"Found {len(snapshots)} unique snapshots. Fetching JSON and rendering HTML...")
+        written_paths = build_archives(
+            snapshots,
+            user,
+            output_path,
+            asset_dir,
+            args.workers,
+            resume=resume,
+        )
+
     print("Finished. Wrote:")
     for path in written_paths:
         print(f"  - {path}")
