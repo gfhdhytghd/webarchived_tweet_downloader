@@ -127,6 +127,7 @@ The downloader also writes:
 - `index.html` is written inside that per-user output directory as the default entry page for static hosting.
 - Resume is enabled by default. Existing valid JSON snapshots, downloaded media assets, and the local `snapshots.json` manifest are reused automatically. Pass `--no-resume` to force re-fetching JSON/media, or `--refresh-snapshots` to force a fresh CDX snapshot list lookup.
 - Missing JSON snapshots are retried automatically across multiple passes in each run before the final HTML pages are finalized.
+- In the default full run, tweet media is prefetched alongside snapshot JSON preparation so the streaming chronological HTML page is not waiting on media downloads at finalize time.
 - `--json-only` stops after the JSON stage and does not write HTML files.
 - `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `<username>_archive/*_archive_assets/json/` directory.
 - Wayback responses are inconsistent; some archived captures may still fail to parse.

@@ -992,6 +992,21 @@ def ensure_snapshot_json(record: SnapshotRecord, resume: bool = True) -> str:
     return "downloaded"
 
 
+def prepare_snapshot_json_and_media(
+    record: SnapshotRecord,
+    resume: bool = True,
+    asset_dir_name: Optional[str] = None,
+    media_dir: Optional[Path] = None,
+    image_cache: Optional[Dict[str, str]] = None,
+) -> str:
+    json_status = ensure_snapshot_json(record, resume=resume)
+    if json_status == "missing":
+        return json_status
+    if asset_dir_name and media_dir is not None:
+        prefetch_snapshot_media(record, asset_dir_name, media_dir, image_cache)
+    return json_status
+
+
 def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: str) -> str:
     attrs = {
         "data-tweet-id": metadata.get("tweet_id", ""),
@@ -1055,6 +1070,21 @@ def download_image_asset(
         if cache is not None:
             cache[image_url] = relative_path
     return relative_path
+
+
+def prefetch_snapshot_media(
+    record: SnapshotRecord,
+    asset_dir_name: str,
+    media_dir: Path,
+    image_cache: Optional[Dict[str, str]] = None,
+) -> None:
+    data = load_snapshot_json(record.json_path)
+    if data is None:
+        return
+
+    _, image_urls, _ = extract_tweet_content(data, record.original_url)
+    for image_url in image_urls:
+        download_image_asset(image_url, record.timestamp, media_dir, asset_dir_name, image_cache)
 
 
 def render_snapshot_entry(
@@ -1279,6 +1309,9 @@ def download_snapshot_records(
     records: List[SnapshotRecord],
     workers: int,
     resume: bool = True,
+    asset_dir_name: Optional[str] = None,
+    media_dir: Optional[Path] = None,
+    image_cache: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, int]:
     total = len(records)
     if total == 0:
@@ -1309,7 +1342,14 @@ def download_snapshot_records(
             next_to_submit = 0
 
             while next_to_submit < len(missing_records) and len(pending) < workers * 4:
-                future = executor.submit(ensure_snapshot_json, missing_records[next_to_submit], False)
+                future = executor.submit(
+                    prepare_snapshot_json_and_media,
+                    missing_records[next_to_submit],
+                    False,
+                    asset_dir_name,
+                    media_dir,
+                    image_cache,
+                )
                 pending[future] = missing_records[next_to_submit]
                 next_to_submit += 1
 
@@ -1330,7 +1370,14 @@ def download_snapshot_records(
                         next_round_missing.append(record)
 
                 while next_to_submit < len(missing_records) and len(pending) < workers * 4:
-                    future = executor.submit(ensure_snapshot_json, missing_records[next_to_submit], False)
+                    future = executor.submit(
+                        prepare_snapshot_json_and_media,
+                        missing_records[next_to_submit],
+                        False,
+                        asset_dir_name,
+                        media_dir,
+                        image_cache,
+                    )
                     pending[future] = missing_records[next_to_submit]
                     next_to_submit += 1
 
@@ -1365,7 +1412,13 @@ def fetch_and_render_snapshot_entry(
     image_cache: Optional[Dict[str, str]] = None,
     resume: bool = True,
 ) -> Tuple[str, Optional[ArchiveEntry]]:
-    json_status = ensure_snapshot_json(record, resume=resume)
+    json_status = prepare_snapshot_json_and_media(
+        record,
+        resume=resume,
+        asset_dir_name=asset_dir_name,
+        media_dir=media_dir,
+        image_cache=image_cache,
+    )
     if json_status == "missing":
         return json_status, None
     return json_status, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache)
@@ -1568,7 +1621,14 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
             f"Retrying {len(missing_records)}/{total} missing JSON snapshots before finalizing sorted outputs...",
             flush=True,
         )
-        download_snapshot_records(missing_records, workers, resume=False)
+        download_snapshot_records(
+            missing_records,
+            workers,
+            resume=False,
+            asset_dir_name=asset_dir_name,
+            media_dir=media_dir,
+            image_cache=image_cache,
+        )
         ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
 
     print(f"Finalizing HTML from {len(ready_records)}/{total} available JSON snapshots...", flush=True)
