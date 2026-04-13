@@ -4,20 +4,21 @@ download_archive.py
 ====================
 
 This script helps you collect archived tweets for a given Twitter account from
-the Internet Archive's Wayback Machine and compile them into a single HTML
-document.  Because the Wayback Machine stores each tweet as a JSON object,
-the script queries the Wayback CDX API to locate all available snapshots of
-tweets from the chosen account and then retrieves the raw JSON payload for
-each snapshot.  It extracts the visible text of every tweet and writes a
-chronological listing into an HTML file.
+the Internet Archive's Wayback Machine and compile them into a small static
+archive bundle. Because the Wayback Machine stores each tweet as a JSON
+object, the script queries the Wayback CDX API to locate all available
+snapshots of tweets from the chosen account and then retrieves the raw JSON
+payload for each snapshot. It extracts visible tweet text, saves the raw JSON
+responses, downloads media into an asset folder, and writes five HTML files:
+the chronological archive plus four sorted variants.
 
 Usage:
 
-    python download_archive.py <twitter_username> [output_html]
+    python download_archive.py <twitter_username>
 
 Example:
 
-    python download_archive.py AnIncandescence anincandescence_archive.html
+    python download_archive.py AnIncandescence
 
 Limitations:
 
@@ -33,24 +34,27 @@ Limitations:
 3.  Some archived tweets may be missing or inaccessible.  The script skips
     over any snapshots that cannot be retrieved or parsed.
 
-4.  This script does not filter or censor content.  If the account's
+4.  This script does not filter or censor content. If the account's
     timeline contains sensitive material, it will appear in the resulting
-    HTML.  Please exercise caution when sharing or viewing the output.
+    archive bundle. Please exercise caution when sharing or viewing the output.
 
 Author: Assistant
 Date: April 13, 2026 (America/New_York)
 """
 
 import sys
+import hashlib
 import json
 import html
-import base64
+import math
 import mimetypes
 import random
 import re
 import threading
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -70,6 +74,14 @@ JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 REQUEST_ATTEMPTS = 4
 TWEET_URL_ID_RE = re.compile(r"/status/(\d+)")
+MIME_EXTENSION_MAP = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+}
+IMAGE_CACHE_LOCK = threading.Lock()
 ARCHIVE_CSS = """
 :root{--bg:#f6f1ea;--paper:rgba(255,253,249,.9);--ink:#1d1b18;--muted:#6a6158;--line:rgba(29,27,24,.12);--accent:#9f4323;--accent-soft:rgba(159,67,35,.08);--shadow:0 20px 50px rgba(36,29,22,.08)}
 *{box-sizing:border-box}
@@ -159,6 +171,72 @@ ARCHIVE_JS = """
   });
 })();
 """
+
+
+@dataclass(frozen=True)
+class ArchiveEntry:
+    block: str
+    dt: datetime
+    time_text: str
+    body_text: str
+    body_length: int
+    entropy: float
+    has_media: bool
+    original_url: str
+    index: int
+
+
+def normalize_text_for_entropy(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def calculate_entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts = Counter(text)
+    total = len(text)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def guess_extension(image_url: str, mime_type: str) -> str:
+    if mime_type in MIME_EXTENSION_MAP:
+        return MIME_EXTENSION_MAP[mime_type]
+    guessed = mimetypes.guess_type(image_url)[0]
+    if guessed in MIME_EXTENSION_MAP:
+        return MIME_EXTENSION_MAP[guessed]
+    suffix = Path(image_url.split("?", 1)[0]).suffix
+    return suffix if suffix else ".img"
+
+
+def ensure_static_files(asset_dir: Path) -> None:
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    (asset_dir / "media").mkdir(parents=True, exist_ok=True)
+    (asset_dir / "json").mkdir(parents=True, exist_ok=True)
+    (asset_dir / "archive.css").write_text(ARCHIVE_CSS, encoding="utf-8")
+    (asset_dir / "archive.js").write_text(ARCHIVE_JS, encoding="utf-8")
+
+
+def sort_entries(entries: List[ArchiveEntry], mode: str) -> List[ArchiveEntry]:
+    if mode == "chronological":
+        return sorted(entries, key=lambda entry: (entry.dt, entry.index))
+    if mode == "time_desc":
+        return sorted(entries, key=lambda entry: (entry.dt, entry.index), reverse=True)
+    if mode == "media_first_time_desc":
+        return sorted(
+            entries,
+            key=lambda entry: (0 if entry.has_media else 1, -entry.dt.timestamp(), -entry.index),
+        )
+    if mode == "text_length_desc":
+        return sorted(
+            entries,
+            key=lambda entry: (-entry.body_length, -entry.dt.timestamp(), -entry.index),
+        )
+    if mode == "text_entropy_desc":
+        return sorted(
+            entries,
+            key=lambda entry: (-entry.entropy, -entry.body_length, -entry.dt.timestamp(), -entry.index),
+        )
+    raise ValueError(f"Unsupported sort mode: {mode}")
 
 
 def get_session() -> requests.Session:
@@ -519,10 +597,17 @@ def build_json_output_path(json_dir: Path, snapshot_timestamp: str, original_url
     return json_dir / f"{snapshot_timestamp}_{tweet_id}.json"
 
 
-def write_snapshot_json(json_dir: Path, snapshot_timestamp: str, original_url: str, metadata: Dict[str, str], raw_json: str) -> str:
+def write_snapshot_json(
+    json_dir: Path,
+    asset_dir_name: str,
+    snapshot_timestamp: str,
+    original_url: str,
+    metadata: Dict[str, str],
+    raw_json: str,
+) -> str:
     json_path = build_json_output_path(json_dir, snapshot_timestamp, original_url, metadata)
     json_path.write_text(raw_json, encoding="utf-8")
-    return json_path.relative_to(json_dir.parent).as_posix()
+    return f"{asset_dir_name}/json/{json_path.name}"
 
 
 def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: str) -> str:
@@ -542,16 +627,19 @@ def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: st
     return " ".join(rendered)
 
 
-def download_image_as_data_url(
+def download_image_asset(
     image_url: str,
     snapshot_timestamp: str,
+    media_dir: Path,
+    asset_dir_name: str,
     cache: Optional[Dict[str, str]] = None,
 ) -> str:
     """
-    Download an image once and return it as a base64 data URL.
+    Download an image once and return its relative asset path.
     """
-    if cache is not None and image_url in cache:
-        return cache[image_url]
+    with IMAGE_CACHE_LOCK:
+        if cache is not None and image_url in cache:
+            return cache[image_url]
 
     candidate_urls = [image_url, f"https://web.archive.org/web/{snapshot_timestamp}im_/{image_url}"]
     resp = None
@@ -566,54 +654,89 @@ def download_image_as_data_url(
 
     mime_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip()
     if not mime_type.startswith("image/"):
-        mime_type = mimetypes.guess_type(image_url)[0] or "application/octet-stream"
+        guessed_mime = mimetypes.guess_type(image_url)[0] or ""
+        mime_type = guessed_mime if guessed_mime.startswith("image/") else "image/jpeg"
 
-    data_url = f"data:{mime_type};base64,{base64.b64encode(resp.content).decode('ascii')}"
-    if cache is not None:
-        cache[image_url] = data_url
-    return data_url
+    extension = guess_extension(image_url, mime_type)
+    digest = hashlib.sha256(resp.content).hexdigest()[:24]
+    filename = f"{digest}{extension}"
+    destination = media_dir / filename
+
+    with IMAGE_CACHE_LOCK:
+        if not destination.exists():
+            destination.write_bytes(resp.content)
+        relative_path = f"{asset_dir_name}/media/{filename}"
+        if cache is not None:
+            cache[image_url] = relative_path
+    return relative_path
 
 
-def render_snapshot_entry(snapshot: Tuple[str, str], json_dir: Path) -> str:
+def render_snapshot_entry(
+    snapshot: Tuple[str, str],
+    index: int,
+    asset_dir_name: str,
+    media_dir: Path,
+    json_dir: Path,
+    image_cache: Optional[Dict[str, str]] = None,
+) -> Optional[ArchiveEntry]:
     """
-    Fetch one archived tweet snapshot and render it as an HTML fragment.
+    Fetch one archived tweet snapshot and render it as an archive entry.
     """
     timestamp, original_url = snapshot
     try:
-        dt = datetime.strptime(timestamp, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S UTC")
+        dt_obj = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
+        dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S UTC")
     except ValueError:
+        dt_obj = datetime.min
         dt = timestamp
 
     text, image_urls, metadata, raw_json = fetch_tweet_content(timestamp, original_url)
     if not text and not image_urls:
-        return ""
+        return None
 
     safe_text = html.escape(text).replace("\n", "<br/>\n")
     text_html = f"  <p>{safe_text}</p>\n" if safe_text else ""
     safe_url = html.escape(original_url)
-    json_relative_path = write_snapshot_json(json_dir, timestamp, original_url, metadata, raw_json) if raw_json else ""
+    json_relative_path = (
+        write_snapshot_json(json_dir, asset_dir_name, timestamp, original_url, metadata, raw_json)
+        if raw_json
+        else ""
+    )
     tweet_attrs = build_tweet_data_attributes(metadata, json_relative_path)
 
     media_html_parts = []
     for image_url in image_urls:
-        data_url = download_image_as_data_url(image_url, timestamp)
-        if not data_url:
+        image_path = download_image_asset(image_url, timestamp, media_dir, asset_dir_name, image_cache)
+        if not image_path:
             continue
         media_html_parts.append(
-            f"  <div class='tweet-media-item'><img src='{data_url}' alt='Archived media from tweet captured on {html.escape(dt)}' loading='lazy' decoding='async'/></div>\n"
+            f"  <div class='tweet-media-item'><img src='{html.escape(image_path)}' alt='Archived media from tweet captured on {html.escape(dt)}' loading='lazy' decoding='async'/></div>\n"
         )
 
     media_html = ""
     if media_html_parts:
         media_html = "  <div class='tweet-media'>\n" + "".join(media_html_parts) + "  </div>\n"
 
-    return (
+    block = (
         f"<div class='tweet' {tweet_attrs}>\n  <h3>{dt}</h3>\n{text_html}{media_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
+    )
+    return ArchiveEntry(
+        block=block,
+        dt=dt_obj,
+        time_text=dt,
+        body_text=text,
+        body_length=len(text),
+        entropy=calculate_entropy(normalize_text_for_entropy(text)),
+        has_media=bool(media_html_parts),
+        original_url=original_url,
+        index=index,
     )
 
 
-def render_document_start(user: str, total: int) -> str:
+def render_document_start(user: str, total: int, asset_dir_name: str, title_suffix: str = "") -> str:
     title = f"Archived tweets of @{user}"
+    if title_suffix:
+        title = f"{title} ({title_suffix})"
     tweet_word = "tweet" if total == 1 else "tweets"
     subtitle = (
         f"{total} archived {tweet_word}. Mobile-friendly layout with tap-to-zoom images built in."
@@ -625,7 +748,7 @@ def render_document_start(user: str, total: int) -> str:
         "<meta charset='UTF-8'>\n"
         "<meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
         f"<title>{html.escape(title)}</title>\n"
-        f"<style>{ARCHIVE_CSS}</style>\n"
+        f"<link rel='stylesheet' href='{html.escape(asset_dir_name)}/archive.css'>\n"
         "</head>\n"
         "<body>\n"
         "<div class='archive-shell'>\n"
@@ -637,13 +760,54 @@ def render_document_start(user: str, total: int) -> str:
     )
 
 
-def render_document_end() -> str:
-    return f"  <script>{ARCHIVE_JS}</script>\n</div>\n</body>\n</html>"
+def render_document_end(asset_dir_name: str) -> str:
+    return f"  <script src='{html.escape(asset_dir_name)}/archive.js'></script>\n</div>\n</body>\n</html>"
 
 
-def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> None:
+def write_archive_html(
+    entries: List[ArchiveEntry],
+    user: str,
+    output_path: Path,
+    asset_dir_name: str,
+    title_suffix: str = "",
+) -> None:
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write(render_document_start(user, len(entries), asset_dir_name, title_suffix))
+        for entry in entries:
+            f.write(entry.block)
+        f.write(render_document_end(asset_dir_name))
+
+
+def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_path: Path, asset_dir_name: str) -> List[Path]:
+    jobs = [
+        ("chronological", "", output_path),
+        ("time_desc", "time desc", output_path.with_name(f"{output_path.stem}_time_desc{output_path.suffix}")),
+        (
+            "media_first_time_desc",
+            "media first, time desc",
+            output_path.with_name(f"{output_path.stem}_media_first_time_desc{output_path.suffix}"),
+        ),
+        (
+            "text_length_desc",
+            "text length desc",
+            output_path.with_name(f"{output_path.stem}_text_length_desc{output_path.suffix}"),
+        ),
+        (
+            "text_entropy_desc",
+            "text entropy desc",
+            output_path.with_name(f"{output_path.stem}_text_entropy_desc{output_path.suffix}"),
+        ),
+    ]
+    written_paths: List[Path] = []
+    for mode, title_suffix, target in jobs:
+        write_archive_html(sort_entries(entries, mode), user, target, asset_dir_name, title_suffix)
+        written_paths.append(target)
+    return written_paths
+
+
+def build_archives(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> List[Path]:
     """
-    Download each tweet and write an HTML document with timestamped entries.
+    Download archived tweets and write the base archive plus four sorted variants.
 
     Parameters
     ----------
@@ -652,67 +816,87 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
     user : str
         Twitter username.  Used for the title and header.
     outfile : str
-        Path where the HTML file will be written.
+        Path where the base chronological HTML file will be written.
     """
     output_path = Path(outfile).resolve()
-    json_dir = output_path.with_name(f"{output_path.stem}_json")
-    json_dir.mkdir(parents=True, exist_ok=True)
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write(render_document_start(user, len(snapshots)))
-        total = len(snapshots)
-        next_to_submit = 0
-        next_to_write = 0
-        completed: Dict[int, str] = {}
+    asset_dir = output_path.with_name(f"{output_path.stem}_assets")
+    ensure_static_files(asset_dir)
+    media_dir = asset_dir / "media"
+    json_dir = asset_dir / "json"
+    asset_dir_name = asset_dir.name
+    image_cache: Dict[str, str] = {}
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            pending = {}
+    total = len(snapshots)
+    next_to_submit = 0
+    next_to_finalize = 0
+    finalized_entries: List[ArchiveEntry] = []
+    completed: Dict[int, Optional[ArchiveEntry]] = {}
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        pending = {}
+
+        while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
+            future = executor.submit(
+                render_snapshot_entry,
+                snapshots[next_to_submit],
+                next_to_submit,
+                asset_dir_name,
+                media_dir,
+                json_dir,
+                image_cache,
+            )
+            pending[future] = next_to_submit
+            next_to_submit += 1
+
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                try:
+                    completed[index] = future.result()
+                except Exception:
+                    completed[index] = None
 
             while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
-                future = executor.submit(render_snapshot_entry, snapshots[next_to_submit], json_dir)
+                future = executor.submit(
+                    render_snapshot_entry,
+                    snapshots[next_to_submit],
+                    next_to_submit,
+                    asset_dir_name,
+                    media_dir,
+                    json_dir,
+                    image_cache,
+                )
                 pending[future] = next_to_submit
                 next_to_submit += 1
 
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    index = pending.pop(future)
-                    try:
-                        completed[index] = future.result()
-                    except Exception:
-                        completed[index] = ""
+            while next_to_finalize in completed:
+                entry = completed.pop(next_to_finalize)
+                if entry is not None:
+                    finalized_entries.append(entry)
+                next_to_finalize += 1
+                if next_to_finalize % 25 == 0:
+                    print(f"Processed {next_to_finalize}/{total} archived tweets...", flush=True)
 
-                while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
-                    future = executor.submit(render_snapshot_entry, snapshots[next_to_submit], json_dir)
-                    pending[future] = next_to_submit
-                    next_to_submit += 1
-
-                while next_to_write in completed:
-                    entry = completed.pop(next_to_write)
-                    if entry:
-                        f.write(entry)
-                    next_to_write += 1
-                    if next_to_write % 25 == 0:
-                        print(f"Processed {next_to_write}/{total} archived tweets...", flush=True)
-                        f.flush()
-
-        f.write(render_document_end())
-        f.flush()
+    return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python download_archive.py <twitter_username> [output_html]")
+    if len(sys.argv) != 2:
+        print("Usage: python download_archive.py <twitter_username>")
         sys.exit(1)
     user = sys.argv[1].lstrip("@").strip()
-    outfile = sys.argv[2] if len(sys.argv) > 2 else f"{user}_archive.html"
+    outfile = f"{user}_archive.html"
     print(f"Fetching list of archived tweets for @{user}...")
     snapshots = fetch_snapshots(user)
     if not snapshots:
         print("No snapshots found or failed to retrieve list.")
         sys.exit(1)
     print(f"Found {len(snapshots)} unique snapshots. Downloading content...")
-    build_html(snapshots, user, outfile)
-    print(f"Finished. Archive saved to {outfile}.")
+    written_paths = build_archives(snapshots, user, outfile)
+    print("Finished. Wrote:")
+    for path in written_paths:
+        print(f"  - {path}")
 
 
 if __name__ == "__main__":
