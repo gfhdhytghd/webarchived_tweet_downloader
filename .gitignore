@@ -1,0 +1,6 @@
+.codex/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*_archive.html
