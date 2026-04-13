@@ -91,16 +91,17 @@ IMAGE_CACHE_LOCK = threading.Lock()
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
 MEDIA_INDEX_NAME = "media_index.json"
 ARCHIVE_FILTER_CSS = """
-.archive-controls{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 22px}
-.archive-toggle{display:inline-flex;align-items:center;gap:12px;min-height:52px;padding:10px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(255,253,249,.82);box-shadow:var(--shadow);cursor:pointer;user-select:none}
+.archive-controls{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px;padding:12px 0;border-bottom:1px solid var(--line)}
+.archive-toggle{display:inline-flex;align-items:center;gap:10px;padding:6px 14px;border:1px solid var(--line);border-radius:9999px;background:var(--bg);cursor:pointer;user-select:none;transition:background .15s,border-color .15s}
+.archive-toggle:hover{background:var(--hover)}
 .archive-toggle-input{position:absolute;opacity:0;pointer-events:none}
-.archive-toggle-switch{position:relative;width:46px;height:28px;flex:0 0 auto;border-radius:999px;background:rgba(29,27,24,.18);transition:background .16s ease}
-.archive-toggle-switch::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 4px 10px rgba(36,29,22,.16);transition:transform .16s ease}
-.archive-toggle-input:checked+.archive-toggle-switch{background:var(--accent)}
-.archive-toggle-input:checked+.archive-toggle-switch::after{transform:translateX(18px)}
-.archive-toggle-label{font-size:.98rem;font-weight:600}
-.archive-toggle-meta{color:var(--muted);font-size:.92rem}
-@media (max-width:720px){.archive-controls{gap:10px;margin-bottom:18px}.archive-toggle{width:100%;justify-content:space-between;gap:10px;padding:10px 12px}}
+.archive-toggle-switch{position:relative;width:36px;height:20px;flex:0 0 auto;border-radius:9999px;background:var(--muted);opacity:.35;transition:background .15s,opacity .15s}
+.archive-toggle-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .15s}
+.archive-toggle-input:checked+.archive-toggle-switch{background:var(--accent);opacity:1}
+.archive-toggle-input:checked+.archive-toggle-switch::after{transform:translateX(16px)}
+.archive-toggle-label{font-size:14px;font-weight:500;color:var(--ink)}
+.archive-toggle-meta{color:var(--muted);font-size:13px}
+@media (max-width:600px){.archive-controls{gap:6px}.archive-toggle{width:100%;justify-content:space-between;padding:8px 12px}}
 """
 ARCHIVE_FILTER_JS = """
 (() => {
@@ -235,32 +236,35 @@ ARCHIVE_FILTER_JS = """
 })();
 """
 ARCHIVE_CSS = """
-:root{--bg:#f6f1ea;--paper:rgba(255,253,249,.9);--ink:#1d1b18;--muted:#6a6158;--line:rgba(29,27,24,.12);--accent:#9f4323;--accent-soft:rgba(159,67,35,.08);--shadow:0 20px 50px rgba(36,29,22,.08)}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
-body{margin:0;color:var(--ink);font-family:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;background:radial-gradient(circle at top left,rgba(159,67,35,.16),transparent 28%),radial-gradient(circle at top right,rgba(25,61,109,.12),transparent 24%),linear-gradient(180deg,#fbf8f2 0%,var(--bg) 46%,#efe3d4 100%)}
-.archive-shell{max-width:960px;margin:0 auto;padding:24px 16px 64px}
-.archive-header{padding:4px 0 22px}
-.archive-badge{display:inline-block;margin-bottom:14px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
-.archive-title{margin:0;font-size:clamp(32px,7vw,64px);line-height:.96;letter-spacing:-.04em}
-.archive-subtitle{margin:14px 0 0;max-width:760px;color:var(--muted);font-size:clamp(16px,2.6vw,20px);line-height:1.6}
-.tweet{margin-bottom:16px;padding:18px 18px 8px;border:1px solid var(--line);border-radius:24px;background:var(--paper);box-shadow:var(--shadow)}
-h3{margin:0;color:var(--muted);font-size:1rem}
-p{margin:10px 0;color:var(--ink);line-height:1.72;overflow-wrap:anywhere}
-.tweet p:last-child{margin-bottom:8px}
-.tweet-media{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0}
-.tweet-media-item{width:min(100%,420px)}
-.tweet-media-item img{display:block;width:100%;max-width:100%;height:auto;border-radius:16px;border:1px solid var(--line);box-shadow:0 16px 36px rgba(36,29,22,.1);cursor:zoom-in;background:#fff;transition:transform .16s ease,box-shadow .16s ease}
-.tweet-media-item img:hover,.tweet-media-item img:focus{transform:translateY(-1px);box-shadow:0 20px 44px rgba(36,29,22,.16);outline:none}
-a{color:#1d4f9d}
-.lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(14,12,11,.88)}
+:root{--bg:#fff;--hover:#f7f9f9;--ink:#0f1419;--muted:#536471;--line:#eff3f4;--accent:#1d9bf0}
+*{box-sizing:border-box;margin:0}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);line-height:1.5}
+.archive-shell{max-width:600px;margin:0 auto;border-left:1px solid var(--line);border-right:1px solid var(--line);min-height:100vh}
+.archive-header{padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);z-index:10}
+.archive-badge{display:none}
+.archive-title{font-size:20px;font-weight:700;line-height:1.3;letter-spacing:normal}
+.archive-subtitle{margin:2px 0 0;color:var(--muted);font-size:13px;line-height:1.4}
+.tweet{padding:12px 16px;border-bottom:1px solid var(--line);transition:background .15s}
+.tweet:hover{background:var(--hover)}
+h3{font-size:13px;font-weight:400;color:var(--muted)}
+p{margin:4px 0 0;font-size:15px;color:var(--ink);line-height:1.5;overflow-wrap:anywhere}
+.tweet p:last-child{margin-bottom:4px}
+.tweet-media{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:2px;margin:10px 0 4px;border-radius:16px;overflow:hidden}
+.tweet-media-item{width:100%}
+.tweet-media-item img{display:block;width:100%;height:auto;cursor:zoom-in;background:var(--line);transition:opacity .15s}
+.tweet-media-item img:hover{opacity:.88}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.7)}
 .lightbox.is-open{display:flex}
 .lightbox-backdrop{position:absolute;inset:0}
 .lightbox-dialog{position:relative;z-index:1;max-width:min(100vw - 32px,1400px);max-height:min(100vh - 32px,1000px);display:flex;align-items:center;justify-content:center}
-.lightbox-image{display:block;max-width:100%;max-height:calc(100vh - 32px);border-radius:18px;box-shadow:0 28px 90px rgba(0,0,0,.42);background:#111}
-.lightbox-close{position:absolute;top:10px;right:10px;z-index:2;border:0;border-radius:999px;padding:10px 12px;background:rgba(255,255,255,.14);color:#fff;font:inherit;cursor:pointer}
+.lightbox-image{display:block;max-width:100%;max-height:calc(100vh - 32px);border-radius:12px;background:#000}
+.lightbox-close{position:absolute;top:8px;right:8px;z-index:2;width:36px;height:36px;border:0;border-radius:50%;padding:0;background:rgba(15,20,25,.75);color:#fff;font-size:18px;line-height:36px;text-align:center;cursor:pointer;backdrop-filter:blur(4px)}
+.lightbox-close:hover{background:rgba(15,20,25,.9)}
 body.lightbox-open{overflow:hidden}
-@media (max-width:720px){.archive-shell{padding:14px 10px 40px}.tweet{padding:14px 14px 6px;border-radius:18px}.tweet-media{gap:10px}.tweet-media-item{width:100%}.lightbox{padding:12px}.lightbox-dialog{max-width:100%;max-height:100%}.lightbox-image{max-height:calc(100vh - 24px);border-radius:14px}.lightbox-close{top:8px;right:8px}}
+@media (max-width:600px){.archive-shell{border-left:none;border-right:none}.tweet{padding:10px 16px}.tweet-media{border-radius:12px}}
 """
 ARCHIVE_JS = """
 (() => {
@@ -324,22 +328,22 @@ ARCHIVE_JS = """
 })();
 """
 INDEX_PAGE_CSS = """
-:root{--bg:#f4efe6;--paper:rgba(255,255,255,.82);--ink:#1c1a18;--muted:#6e6257;--line:rgba(28,26,24,.12);--accent:#b44f2c;--accent-2:#274690;--shadow:0 24px 60px rgba(37,29,22,.12)}
-*{box-sizing:border-box}
-body{margin:0;color:var(--ink);font-family:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;background:radial-gradient(circle at top left,rgba(180,79,44,.2),transparent 32%),radial-gradient(circle at top right,rgba(39,70,144,.16),transparent 28%),linear-gradient(180deg,#f9f5ef 0%,var(--bg) 48%,#efe4d4 100%)}
-main{max-width:1080px;margin:0 auto;padding:56px 24px 72px}
-.hero{padding:28px 0 24px}
-.kicker{display:inline-block;margin-bottom:14px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;color:var(--accent-2);background:rgba(255,255,255,.55);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
-h1{margin:0;font-size:clamp(36px,8vw,72px);line-height:.95;letter-spacing:-.04em}
-.lead{max-width:760px;margin:18px 0 0;color:var(--muted);font-size:clamp(18px,2.4vw,24px);line-height:1.5}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;margin-top:34px}
-.card{display:block;min-height:220px;padding:22px;border:1px solid var(--line);border-radius:24px;background:var(--paper);box-shadow:var(--shadow);text-decoration:none;color:inherit;backdrop-filter:blur(10px);transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease}
-.card:hover{transform:translateY(-4px);box-shadow:0 28px 70px rgba(37,29,22,.18);border-color:rgba(180,79,44,.35)}
-.eyebrow{display:inline-block;color:var(--accent);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
-.card h2{margin:14px 0 12px;font-size:28px;line-height:1.02}
-.card p{margin:0;color:var(--muted);line-height:1.6}
-.footer{margin-top:26px;color:var(--muted);font-size:14px}
-@media (max-width:640px){main{padding:28px 16px 40px}.card{min-height:unset}}
+:root{--bg:#fff;--ink:#0f1419;--muted:#536471;--line:#eff3f4;--accent:#1d9bf0;--hover:#f7f9f9}
+*{box-sizing:border-box;margin:0}
+body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);line-height:1.5}
+main{max-width:600px;margin:0 auto;border-left:1px solid var(--line);border-right:1px solid var(--line);min-height:100vh;padding:0 0 40px}
+.hero{padding:12px 16px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);z-index:10}
+.kicker{display:none}
+h1{font-size:20px;font-weight:700;line-height:1.3}
+.lead{color:var(--muted);font-size:13px;margin:2px 0 0;line-height:1.4}
+.grid{display:flex;flex-direction:column}
+.card{display:block;padding:16px;border-bottom:1px solid var(--line);text-decoration:none;color:inherit;transition:background .15s}
+.card:hover{background:var(--hover)}
+.eyebrow{display:none}
+.card h2{font-size:15px;font-weight:700;line-height:1.3}
+.card p{margin:2px 0 0;color:var(--muted);font-size:13px;line-height:1.4}
+.footer{padding:12px 16px;color:var(--muted);font-size:13px;border-top:1px solid var(--line)}
+@media (max-width:600px){main{border-left:none;border-right:none}}
 """
 
 
@@ -1092,7 +1096,7 @@ def render_document_start(user: str, total: int, asset_dir_name: str, title_suff
         title = f"{title} ({title_suffix})"
     tweet_word = "tweet" if total == 1 else "tweets"
     subtitle = (
-        f"{total} archived {tweet_word}. Mobile-friendly layout with tap-to-zoom images built in."
+        f"{total} archived {tweet_word}"
     )
     return (
         "<!DOCTYPE html>\n"
@@ -1149,7 +1153,7 @@ def render_index_document(user: str, total: int, output_path: Path) -> str:
         )
         for href, label, description in cards
     )
-    lead = f"{total} archived {tweet_word} with five linked views for quick browsing and publishing."
+    lead = f"{total} archived {tweet_word}"
     return (
         "<!DOCTYPE html>\n"
         "<html lang='en'>\n"
@@ -1169,7 +1173,7 @@ def render_index_document(user: str, total: int, output_path: Path) -> str:
         "  <section class='grid'>\n"
         f"{card_html}\n"
         "  </section>\n"
-        "  <p class='footer'>This index is generated automatically. Shared JSON and media assets stay under the archive assets folder.</p>\n"
+        "  <p class='footer'>Auto-generated index</p>\n"
         "</main>\n"
         "</body>\n"
         "</html>\n"
@@ -1196,8 +1200,8 @@ def write_archive_html(
         f.write(render_document_end(asset_dir_name))
 
 
-def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_path: Path, asset_dir_name: str) -> List[Path]:
-    jobs = [
+def get_archive_output_jobs(output_path: Path) -> List[Tuple[str, str, Path]]:
+    return [
         ("chronological", "", output_path),
         ("time_desc", "time desc", output_path.with_name(f"{output_path.stem}_time_desc{output_path.suffix}")),
         (
@@ -1216,12 +1220,32 @@ def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_pat
             output_path.with_name(f"{output_path.stem}_text_entropy_desc{output_path.suffix}"),
         ),
     ]
+
+
+def write_additional_archive_outputs(
+    entries: List[ArchiveEntry],
+    user: str,
+    output_path: Path,
+    asset_dir_name: str,
+) -> List[Path]:
     written_paths: List[Path] = []
-    for mode, title_suffix, target in jobs:
+    for mode, title_suffix, target in get_archive_output_jobs(output_path)[1:]:
         write_archive_html(sort_entries(entries, mode), user, target, asset_dir_name, title_suffix)
         written_paths.append(target)
     written_paths.append(write_index_html(user, len(entries), output_path))
     return written_paths
+
+
+def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_path: Path, asset_dir_name: str) -> List[Path]:
+    chronological_mode, chronological_suffix, chronological_target = get_archive_output_jobs(output_path)[0]
+    write_archive_html(
+        sort_entries(entries, chronological_mode),
+        user,
+        chronological_target,
+        asset_dir_name,
+        chronological_suffix,
+    )
+    return [chronological_target] + write_additional_archive_outputs(entries, user, output_path, asset_dir_name)
 
 
 def download_snapshot_records(
@@ -1265,6 +1289,20 @@ def download_snapshot_records(
                 print(f"Fetched {completed_count}/{total} JSON snapshots...", flush=True)
 
     return available_count, total
+
+
+def fetch_and_render_snapshot_entry(
+    record: SnapshotRecord,
+    index: int,
+    asset_dir_name: str,
+    media_dir: Path,
+    image_cache: Optional[Dict[str, str]] = None,
+    resume: bool = True,
+) -> Tuple[bool, Optional[ArchiveEntry]]:
+    json_ready = ensure_snapshot_json(record, resume=resume)
+    if not json_ready:
+        return False, None
+    return True, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache)
 
 
 def build_archives_from_snapshot_records(
@@ -1352,9 +1390,85 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
     ensure_asset_directories(asset_dir)
     records = build_snapshot_records(snapshots, asset_dir / "json")
     write_snapshot_manifest(asset_dir, user, records)
-    available_count, total = download_snapshot_records(records, workers, resume=resume)
-    print(f"JSON snapshots ready: {available_count}/{total}")
-    return build_archives_from_snapshot_records(records, user, output_path, asset_dir, workers, resume=resume)
+    ensure_static_files(asset_dir)
+    media_dir = asset_dir / "media"
+    asset_dir_name = asset_dir.name
+    image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
+
+    total = len(records)
+    fetched_count = 0
+    next_to_submit = 0
+    next_to_finalize = 0
+    last_reported_fetched = -1
+    finalized_entries: List[ArchiveEntry] = []
+    completed: Dict[int, Tuple[bool, Optional[ArchiveEntry]]] = {}
+
+    with output_path.open("w", encoding="utf-8") as base_file:
+        base_file.write(render_document_start(user, total, asset_dir_name))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {}
+
+            while next_to_submit < total and len(pending) < workers * 4:
+                future = executor.submit(
+                    fetch_and_render_snapshot_entry,
+                    records[next_to_submit],
+                    next_to_submit,
+                    asset_dir_name,
+                    media_dir,
+                    image_cache,
+                    resume,
+                )
+                pending[future] = next_to_submit
+                next_to_submit += 1
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = pending.pop(future)
+                    try:
+                        completed[index] = future.result()
+                    except Exception:
+                        completed[index] = (False, None)
+
+                while next_to_submit < total and len(pending) < workers * 4:
+                    future = executor.submit(
+                        fetch_and_render_snapshot_entry,
+                        records[next_to_submit],
+                        next_to_submit,
+                        asset_dir_name,
+                        media_dir,
+                        image_cache,
+                        resume,
+                    )
+                    pending[future] = next_to_submit
+                    next_to_submit += 1
+
+                while next_to_finalize in completed:
+                    json_ready, entry = completed.pop(next_to_finalize)
+                    if json_ready:
+                        fetched_count += 1
+                    if entry is not None:
+                        base_file.write(entry.block)
+                        base_file.flush()
+                        finalized_entries.append(entry)
+                    next_to_finalize += 1
+                    if (
+                        fetched_count != last_reported_fetched
+                        and fetched_count
+                        and (fetched_count % 25 == 0 or fetched_count == total)
+                    ):
+                        print(f"Fetched {fetched_count}/{total} JSON snapshots...", flush=True)
+                        last_reported_fetched = fetched_count
+                    if next_to_finalize % 25 == 0 or next_to_finalize == total:
+                        print(f"Processed {next_to_finalize}/{total} archived tweets...", flush=True)
+
+        base_file.write(render_document_end(asset_dir_name))
+
+    print(f"JSON snapshots ready: {fetched_count}/{total}")
+    write_media_cache(asset_dir, image_cache)
+    write_archive_html(finalized_entries, user, output_path, asset_dir_name)
+    return [output_path] + write_additional_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
 
 
 def positive_int(value: str) -> int:

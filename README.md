@@ -112,7 +112,8 @@ The downloader also writes:
 3. Downloads archived tweet payloads with retry and backoff, or reuses local JSON files during resume runs.
 4. Extracts text from multiple Twitter response formats, including legacy and newer nested structures.
 5. Saves media, CSS, JS, raw JSON, and manifest/cache files into a shared asset folder.
-6. Writes the main chronological archive plus four sorted HTML variants.
+6. Streams the main chronological archive while the default full run is downloading snapshots.
+7. Writes the remaining four sorted HTML variants plus `index.html` after the full dataset is ready.
 
 ## Notes
 
