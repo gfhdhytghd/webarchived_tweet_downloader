@@ -43,6 +43,14 @@ The generated HTML now includes:
 - larger card-style tweet blocks
 - clickable / tap-to-zoom images via a built-in lightbox
 - lazy-loaded embedded images
+- hidden `data-*` reply metadata on each tweet block for later filtering
+
+The downloader also writes raw archived tweet payloads into a sibling JSON folder:
+
+- output HTML: `account_archive.html`
+- raw payload folder: `account_archive_json/`
+
+Each JSON file is stored as one archived response per tweet capture, named with the capture timestamp and tweet id.
 
 ## Reordering An Existing Archive
 
@@ -60,6 +68,7 @@ This writes four sibling files next to the input:
 - `*_text_entropy_desc.html`
 
 The sorter preserves the existing HTML structure and only changes tweet order.
+If the input archive contains hidden reply metadata such as `data-conversation-id` or `data-is-reply`, those attributes are preserved in the sorted outputs.
 
 ## What The Script Does
 

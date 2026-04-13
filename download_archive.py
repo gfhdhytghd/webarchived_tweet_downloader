@@ -47,10 +47,12 @@ import html
 import base64
 import mimetypes
 import random
+import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -67,6 +69,7 @@ MAX_WORKERS = 12
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 REQUEST_ATTEMPTS = 4
+TWEET_URL_ID_RE = re.compile(r"/status/(\d+)")
 ARCHIVE_CSS = """
 :root{--bg:#f6f1ea;--paper:rgba(255,253,249,.9);--ink:#1d1b18;--muted:#6a6158;--line:rgba(29,27,24,.12);--accent:#9f4323;--accent-soft:rgba(159,67,35,.08);--shadow:0 20px 50px rgba(36,29,22,.08)}
 *{box-sizing:border-box}
@@ -329,9 +332,107 @@ def _extract_tweet_text_from_node(node: dict) -> str:
     return ""
 
 
-def extract_tweet_content(data: dict) -> Tuple[str, List[str]]:
+def _coerce_string(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _extract_metadata_from_node(node: dict) -> Dict[str, str]:
+    legacy = node.get("legacy") if isinstance(node.get("legacy"), dict) else {}
+    tweet_id = _coerce_string(
+        node.get("rest_id") or node.get("id_str") or legacy.get("id_str") or node.get("id")
+    )
+    conversation_id = _coerce_string(
+        node.get("conversation_id_str")
+        or legacy.get("conversation_id_str")
+        or node.get("conversation_id")
+        or legacy.get("conversation_id")
+    )
+    in_reply_to_status_id = _coerce_string(
+        node.get("in_reply_to_status_id_str")
+        or legacy.get("in_reply_to_status_id_str")
+        or node.get("in_reply_to_status_id")
+        or legacy.get("in_reply_to_status_id")
+    )
+    in_reply_to_user_id = _coerce_string(
+        node.get("in_reply_to_user_id_str")
+        or legacy.get("in_reply_to_user_id_str")
+        or node.get("in_reply_to_user_id")
+        or legacy.get("in_reply_to_user_id")
+    )
+    in_reply_to_screen_name = _coerce_string(
+        node.get("in_reply_to_screen_name") or legacy.get("in_reply_to_screen_name")
+    )
+    return {
+        "tweet_id": tweet_id,
+        "conversation_id": conversation_id,
+        "in_reply_to_status_id": in_reply_to_status_id,
+        "in_reply_to_user_id": in_reply_to_user_id,
+        "in_reply_to_screen_name": in_reply_to_screen_name,
+    }
+
+
+def _iter_candidate_tweet_nodes(node):
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_candidate_tweet_nodes(item)
+        return
+    if not isinstance(node, dict):
+        return
+
+    metadata = _extract_metadata_from_node(node)
+    if metadata["tweet_id"] or _extract_tweet_text_from_node(node):
+        yield node
+
+    for value in node.values():
+        yield from _iter_candidate_tweet_nodes(value)
+
+
+def extract_tweet_metadata(data: dict, original_url: str) -> Dict[str, str]:
+    target_tweet_id_match = TWEET_URL_ID_RE.search(original_url)
+    target_tweet_id = target_tweet_id_match.group(1) if target_tweet_id_match else ""
+    fallback_metadata: Optional[Dict[str, str]] = None
+
+    for node in _iter_candidate_tweet_nodes(data):
+        metadata = _extract_metadata_from_node(node)
+        if metadata["tweet_id"] and fallback_metadata is None:
+            fallback_metadata = metadata
+        if target_tweet_id and metadata["tweet_id"] == target_tweet_id:
+            fallback_metadata = metadata
+            break
+
+    metadata = fallback_metadata or {
+        "tweet_id": target_tweet_id,
+        "conversation_id": "",
+        "in_reply_to_status_id": "",
+        "in_reply_to_user_id": "",
+        "in_reply_to_screen_name": "",
+    }
+
+    is_reply = "unknown"
+    is_thread_root = "unknown"
+    if metadata["in_reply_to_status_id"]:
+        is_reply = "true"
+        is_thread_root = "false"
+    elif metadata["tweet_id"] and metadata["conversation_id"]:
+        if metadata["tweet_id"] == metadata["conversation_id"]:
+            is_reply = "false"
+            is_thread_root = "true"
+        else:
+            is_reply = "true"
+            is_thread_root = "false"
+
+    metadata["is_reply"] = is_reply
+    metadata["is_thread_root"] = is_thread_root
+    return metadata
+
+
+def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[str], Dict[str, str]]:
     """
-    Extract visible tweet text and photo URLs from a Wayback JSON payload.
+    Extract visible tweet text, photo URLs, and reply metadata from a payload.
     """
     texts: List[str] = []
     image_urls: List[str] = []
@@ -393,20 +494,52 @@ def extract_tweet_content(data: dict) -> Tuple[str, List[str]]:
             deduped_image_urls.append(image_url)
             seen.add(image_url)
 
-    return "\n".join(texts), deduped_image_urls
+    return "\n".join(texts), deduped_image_urls, extract_tweet_metadata(data, original_url)
 
 
-def fetch_tweet_content(snapshot_timestamp: str, original_url: str) -> Tuple[str, List[str]]:
+def fetch_tweet_content(snapshot_timestamp: str, original_url: str) -> Tuple[str, List[str], Dict[str, str], str]:
     """
-    Retrieve the archived tweet JSON payload and extract text plus photo URLs.
+    Retrieve the archived tweet JSON payload and extract text, media, and metadata.
     """
     snapshot_url = f"https://web.archive.org/web/{snapshot_timestamp}id_/{original_url}"
     try:
         resp = get_with_retry(snapshot_url, timeout=JSON_TIMEOUT)
         data = resp.json()
     except Exception:
-        return "", []
-    return extract_tweet_content(data)
+        return "", [], {}, ""
+    text, image_urls, metadata = extract_tweet_content(data, original_url)
+    return text, image_urls, metadata, resp.text
+
+
+def build_json_output_path(json_dir: Path, snapshot_timestamp: str, original_url: str, metadata: Dict[str, str]) -> Path:
+    tweet_id = metadata.get("tweet_id") or ""
+    if not tweet_id:
+        match = TWEET_URL_ID_RE.search(original_url)
+        tweet_id = match.group(1) if match else "unknown"
+    return json_dir / f"{snapshot_timestamp}_{tweet_id}.json"
+
+
+def write_snapshot_json(json_dir: Path, snapshot_timestamp: str, original_url: str, metadata: Dict[str, str], raw_json: str) -> str:
+    json_path = build_json_output_path(json_dir, snapshot_timestamp, original_url, metadata)
+    json_path.write_text(raw_json, encoding="utf-8")
+    return json_path.relative_to(json_dir.parent).as_posix()
+
+
+def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: str) -> str:
+    attrs = {
+        "data-tweet-id": metadata.get("tweet_id", ""),
+        "data-conversation-id": metadata.get("conversation_id", ""),
+        "data-in-reply-to-status-id": metadata.get("in_reply_to_status_id", ""),
+        "data-in-reply-to-user-id": metadata.get("in_reply_to_user_id", ""),
+        "data-in-reply-to-screen-name": metadata.get("in_reply_to_screen_name", ""),
+        "data-is-reply": metadata.get("is_reply", "unknown"),
+        "data-is-thread-root": metadata.get("is_thread_root", "unknown"),
+        "data-json-path": json_relative_path,
+    }
+    rendered = []
+    for key, value in attrs.items():
+        rendered.append(f"{key}='{html.escape(value, quote=True)}'")
+    return " ".join(rendered)
 
 
 def download_image_as_data_url(
@@ -441,7 +574,7 @@ def download_image_as_data_url(
     return data_url
 
 
-def render_snapshot_entry(snapshot: Tuple[str, str]) -> str:
+def render_snapshot_entry(snapshot: Tuple[str, str], json_dir: Path) -> str:
     """
     Fetch one archived tweet snapshot and render it as an HTML fragment.
     """
@@ -451,13 +584,15 @@ def render_snapshot_entry(snapshot: Tuple[str, str]) -> str:
     except ValueError:
         dt = timestamp
 
-    text, image_urls = fetch_tweet_content(timestamp, original_url)
+    text, image_urls, metadata, raw_json = fetch_tweet_content(timestamp, original_url)
     if not text and not image_urls:
         return ""
 
     safe_text = html.escape(text).replace("\n", "<br/>\n")
     text_html = f"  <p>{safe_text}</p>\n" if safe_text else ""
     safe_url = html.escape(original_url)
+    json_relative_path = write_snapshot_json(json_dir, timestamp, original_url, metadata, raw_json) if raw_json else ""
+    tweet_attrs = build_tweet_data_attributes(metadata, json_relative_path)
 
     media_html_parts = []
     for image_url in image_urls:
@@ -473,7 +608,7 @@ def render_snapshot_entry(snapshot: Tuple[str, str]) -> str:
         media_html = "  <div class='tweet-media'>\n" + "".join(media_html_parts) + "  </div>\n"
 
     return (
-        f"<div class='tweet'>\n  <h3>{dt}</h3>\n{text_html}{media_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
+        f"<div class='tweet' {tweet_attrs}>\n  <h3>{dt}</h3>\n{text_html}{media_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
     )
 
 
@@ -519,6 +654,9 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
     outfile : str
         Path where the HTML file will be written.
     """
+    output_path = Path(outfile).resolve()
+    json_dir = output_path.with_name(f"{output_path.stem}_json")
+    json_dir.mkdir(parents=True, exist_ok=True)
     with open(outfile, "w", encoding="utf-8") as f:
         f.write(render_document_start(user, len(snapshots)))
         total = len(snapshots)
@@ -530,7 +668,7 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
             pending = {}
 
             while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
-                future = executor.submit(render_snapshot_entry, snapshots[next_to_submit])
+                future = executor.submit(render_snapshot_entry, snapshots[next_to_submit], json_dir)
                 pending[future] = next_to_submit
                 next_to_submit += 1
 
@@ -544,7 +682,7 @@ def build_html(snapshots: List[Tuple[str, str]], user: str, outfile: str) -> Non
                         completed[index] = ""
 
                 while next_to_submit < total and len(pending) < MAX_WORKERS * 4:
-                    future = executor.submit(render_snapshot_entry, snapshots[next_to_submit])
+                    future = executor.submit(render_snapshot_entry, snapshots[next_to_submit], json_dir)
                     pending[future] = next_to_submit
                     next_to_submit += 1
 

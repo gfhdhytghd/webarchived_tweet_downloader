@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-TWEET_MARKER = "<div class='tweet'>"
+TWEET_MARKERS = ("<div class='tweet'>", "<div class='tweet' ")
 TITLE_RE = re.compile(r"(<title>)(.*?)(</title>)", re.DOTALL)
 H1_RE = re.compile(r"(<h1\b[^>]*>)(.*?)(</h1>)", re.DOTALL)
 TIME_RE = re.compile(r"<h3>(.*?)</h3>", re.DOTALL)
@@ -42,7 +42,9 @@ class TweetEntry:
 
 
 def split_tweet_blocks(document: str) -> tuple[str, list[str], str]:
-    first = document.find(TWEET_MARKER)
+    first_candidates = [document.find(marker) for marker in TWEET_MARKERS]
+    first_candidates = [index for index in first_candidates if index != -1]
+    first = min(first_candidates) if first_candidates else -1
     if first == -1:
         raise ValueError("Could not find any tweet blocks in the input HTML.")
 
@@ -52,7 +54,9 @@ def split_tweet_blocks(document: str) -> tuple[str, list[str], str]:
     doc_len = len(document)
 
     while True:
-        start = document.find(TWEET_MARKER, pos)
+        start_candidates = [document.find(marker, pos) for marker in TWEET_MARKERS]
+        start_candidates = [index for index in start_candidates if index != -1]
+        start = min(start_candidates) if start_candidates else -1
         if start == -1:
             break
 
