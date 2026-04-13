@@ -511,6 +511,25 @@ def load_snapshot_records(asset_dir: Path, json_dir: Path, user: str) -> List[Sn
     return records
 
 
+def resolve_snapshot_records(
+    user: str,
+    asset_dir: Path,
+    json_dir: Path,
+    resume: bool = True,
+    refresh: bool = False,
+) -> Tuple[List[SnapshotRecord], str]:
+    if resume and not refresh:
+        records = load_snapshot_records(asset_dir, json_dir, user)
+        if records:
+            return records, "local"
+
+    snapshots = fetch_snapshots(user)
+    if not snapshots:
+        return [], "remote"
+    records = build_snapshot_records(snapshots, json_dir)
+    return records, "remote"
+
+
 def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
     cache_path = media_index_path(asset_dir)
     if not cache_path.exists():
@@ -1335,6 +1354,8 @@ def build_archives_from_snapshot_records(
     total = len(records)
     next_to_submit = 0
     next_to_finalize = 0
+    rendered_count = 0
+    last_reported_rendered = -1
     finalized_entries: List[ArchiveEntry] = []
     completed: Dict[int, Optional[ArchiveEntry]] = {}
 
@@ -1374,15 +1395,22 @@ def build_archives_from_snapshot_records(
                 pending[future] = next_to_submit
                 next_to_submit += 1
 
-            while next_to_finalize in completed:
-                entry = completed.pop(next_to_finalize)
-                if entry is not None:
-                    finalized_entries.append(entry)
-                next_to_finalize += 1
-                if next_to_finalize % 25 == 0 or next_to_finalize == total:
-                    print(f"Processed {next_to_finalize}/{total} archived tweets...", flush=True)
+                while next_to_finalize in completed:
+                    entry = completed.pop(next_to_finalize)
+                    if entry is not None:
+                        finalized_entries.append(entry)
+                        rendered_count += 1
+                    next_to_finalize += 1
+                    if (
+                        rendered_count != last_reported_rendered
+                        and rendered_count
+                        and (rendered_count % 25 == 0 or next_to_finalize == total)
+                    ):
+                        print(f"Rendered {rendered_count}/{total} archive entries...", flush=True)
+                        last_reported_rendered = rendered_count
 
     write_media_cache(asset_dir, image_cache)
+    print(f"Archive entries rendered: {rendered_count}/{total}")
     return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
 
 
@@ -1400,6 +1428,8 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
     next_to_submit = 0
     next_to_finalize = 0
     last_reported_fetched = -1
+    rendered_count = 0
+    last_reported_rendered = -1
     finalized_entries: List[ArchiveEntry] = []
     completed: Dict[int, Tuple[bool, Optional[ArchiveEntry]]] = {}
 
@@ -1452,6 +1482,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                         base_file.write(entry.block)
                         base_file.flush()
                         finalized_entries.append(entry)
+                        rendered_count += 1
                     next_to_finalize += 1
                     if (
                         fetched_count != last_reported_fetched
@@ -1460,12 +1491,18 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                     ):
                         print(f"Fetched {fetched_count}/{total} JSON snapshots...", flush=True)
                         last_reported_fetched = fetched_count
-                    if next_to_finalize % 25 == 0 or next_to_finalize == total:
-                        print(f"Processed {next_to_finalize}/{total} archived tweets...", flush=True)
+                    if (
+                        rendered_count != last_reported_rendered
+                        and rendered_count
+                        and (rendered_count % 25 == 0 or next_to_finalize == total)
+                    ):
+                        print(f"Rendered {rendered_count}/{total} archive entries...", flush=True)
+                        last_reported_rendered = rendered_count
 
         base_file.write(render_document_end(asset_dir_name))
 
     print(f"JSON snapshots ready: {fetched_count}/{total}")
+    print(f"Archive entries rendered: {rendered_count}/{total}")
     write_media_cache(asset_dir, image_cache)
     write_archive_html(finalized_entries, user, output_path, asset_dir_name)
     return [output_path] + write_additional_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
@@ -1507,6 +1544,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not reuse existing JSON or media files; fetch them again when applicable.",
     )
+    parser.add_argument(
+        "--refresh-snapshots",
+        action="store_true",
+        help="Ignore the local snapshots manifest and fetch the Wayback CDX snapshot list again.",
+    )
     return parser.parse_args()
 
 
@@ -1536,15 +1578,25 @@ def main():
             resume=resume,
         )
     else:
-        print(f"Fetching list of archived tweets for @{user}...")
-        snapshots = fetch_snapshots(user)
-        if not snapshots:
+        print(f"Resolving snapshot list for @{user}...")
+        records, record_source = resolve_snapshot_records(
+            user,
+            asset_dir,
+            json_dir,
+            resume=resume,
+            refresh=args.refresh_snapshots,
+        )
+        if not records:
             print("No snapshots found or failed to retrieve list.")
             sys.exit(1)
+        if record_source == "local":
+            print(f"Loaded {len(records)} snapshot records from {snapshot_manifest_path(asset_dir)}")
+        else:
+            print(f"Fetched {len(records)} unique snapshots from Wayback CDX")
+        snapshots = [(record.timestamp, record.original_url) for record in records]
 
         if args.json_only:
             ensure_asset_directories(asset_dir)
-            records = build_snapshot_records(snapshots, json_dir)
             write_snapshot_manifest(asset_dir, user, records)
 
             print(f"Found {len(records)} unique snapshots. Fetching JSON...")
