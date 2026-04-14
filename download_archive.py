@@ -903,6 +903,14 @@ def get_with_retry(url: str, *, timeout: int, params: Optional[dict] = None) -> 
             resp = get_session().get(url, params=params, timeout=timeout)
             resp.raise_for_status()
             return resp
+        except requests.HTTPError as exc:
+            last_exc = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code is not None and 400 <= status_code < 500 and status_code not in {408, 429}:
+                break
+            if attempt == REQUEST_ATTEMPTS:
+                break
+            time.sleep((0.4 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.2))
         except Exception as exc:
             last_exc = exc
             if attempt == REQUEST_ATTEMPTS:
