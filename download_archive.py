@@ -83,6 +83,8 @@ DEFAULT_JSON_RETRY_PASSES = 3
 JSON_RETRY_BACKOFF_SECONDS = 2.0
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
+MEDIA_CDX_TIMEOUT = 20
+MEDIA_CDX_FALLBACK_LIMIT = 3
 REQUEST_ATTEMPTS = 4
 TWEET_URL_ID_RE = re.compile(r"/status/(\d+)")
 SNAPSHOT_FILENAME_RE = re.compile(r"^(?P<timestamp>\d{14})_(?P<tweet_id>.+)\.json$")
@@ -95,6 +97,8 @@ MIME_EXTENSION_MAP = {
     "video/mp4": ".mp4",
 }
 IMAGE_CACHE_LOCK = threading.RLock()
+MEDIA_CDX_LOOKUP_LOCK = threading.RLock()
+MEDIA_CDX_LOOKUP_CACHE: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
 MEDIA_INDEX_NAME = "media_index.json"
 ARCHIVE_FILTER_CSS = """
@@ -429,24 +433,17 @@ def guess_extension(image_url: str, mime_type: str) -> str:
     return suffix if suffix else ".img"
 
 
-def build_asset_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[str]:
-    candidates: List[str] = []
+def build_asset_source_variants(asset_url: str) -> List[str]:
+    variants: List[str] = []
     seen = set()
 
     def add(url: str) -> None:
         if not url or url in seen:
             return
         seen.add(url)
-        candidates.append(url)
+        variants.append(url)
 
-    def add_archive_variants(url: str) -> None:
-        add(url)
-        add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{url}")
-        add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{url}")
-        add(f"https://web.archive.org/web/{snapshot_timestamp}/{url}")
-
-    add_archive_variants(asset_url)
-
+    add(asset_url)
     parsed = urlparse(asset_url)
     if parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/"):
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -465,7 +462,95 @@ def build_asset_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[
             normalized_url = urlunparse(
                 parsed._replace(path=normalized_path, query=urlencode(normalized_query))
             )
-            add_archive_variants(normalized_url)
+            add(normalized_url)
+
+    if parsed.netloc.endswith("video.twimg.com") and parsed.query:
+        add(urlunparse(parsed._replace(query="")))
+
+    return variants
+
+
+def build_archived_urls_for_source_url(source_url: str, snapshot_timestamp: str) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+
+    def add(url: str) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    add(source_url)
+    if snapshot_timestamp:
+        add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{source_url}")
+        add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{source_url}")
+        add(f"https://web.archive.org/web/{snapshot_timestamp}/{source_url}")
+
+    return urls
+
+
+def build_asset_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[str]:
+    candidates: List[str] = []
+    seen = set()
+
+    def add(url: str) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    for source_url in build_asset_source_variants(asset_url):
+        for candidate in build_archived_urls_for_source_url(source_url, snapshot_timestamp):
+            add(candidate)
+
+    return candidates
+
+
+def query_closest_media_captures(source_url: str, snapshot_timestamp: str) -> List[Tuple[str, str]]:
+    cache_key = (source_url, snapshot_timestamp)
+    with MEDIA_CDX_LOOKUP_LOCK:
+        cached = MEDIA_CDX_LOOKUP_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    params = {
+        "url": source_url,
+        "output": "json",
+        "fl": "timestamp,original,statuscode,mimetype",
+        "filter": "statuscode:200",
+        "limit": str(MEDIA_CDX_FALLBACK_LIMIT),
+        "closest": snapshot_timestamp,
+        "collapse": "digest",
+    }
+    rows: List[Tuple[str, str]] = []
+    try:
+        resp = get_with_retry(CDX_BASE_URL, params=params, timeout=MEDIA_CDX_TIMEOUT)
+        payload = resp.json()
+        for row in payload[1:]:
+            if len(row) >= 2 and row[0] and row[1]:
+                rows.append((row[0], row[1]))
+    except Exception:
+        rows = []
+
+    with MEDIA_CDX_LOOKUP_LOCK:
+        MEDIA_CDX_LOOKUP_CACHE[cache_key] = rows
+    return rows
+
+
+def build_closest_capture_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[str]:
+    candidates: List[str] = []
+    seen = set()
+
+    def add(url: str) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    for source_url in build_asset_source_variants(asset_url):
+        for capture_timestamp, original_url in query_closest_media_captures(source_url, snapshot_timestamp):
+            for candidate in build_archived_urls_for_source_url(original_url, capture_timestamp):
+                add(candidate)
 
     return candidates
 
@@ -1419,6 +1504,13 @@ def download_image_asset(
         except Exception:
             resp = None
     if resp is None:
+        for candidate_url in build_closest_capture_candidate_urls(image_url, snapshot_timestamp):
+            try:
+                resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
+                break
+            except Exception:
+                resp = None
+    if resp is None:
         return ""
 
     mime_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip()
@@ -1466,6 +1558,13 @@ def download_video_asset(
             break
         except Exception:
             resp = None
+    if resp is None:
+        for candidate_url in build_closest_capture_candidate_urls(video_url, snapshot_timestamp):
+            try:
+                resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
+                break
+            except Exception:
+                resp = None
     if resp is None:
         return ""
 
