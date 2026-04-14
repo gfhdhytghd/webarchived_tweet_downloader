@@ -1512,6 +1512,128 @@ def prefetch_snapshot_media(
                 download_image_asset(media_item.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache)
 
 
+def collect_snapshot_media_jobs(record: SnapshotRecord) -> List[Tuple[str, str, str]]:
+    data = load_snapshot_json(record.json_path)
+    if data is None:
+        return []
+
+    _, media_items, _, ref_tweets = extract_tweet_content(data, record.original_url)
+    jobs: List[Tuple[str, str, str]] = []
+
+    def add_media_item(media_item: TweetMediaItem) -> None:
+        if media_item.kind == "image" and media_item.url:
+            jobs.append(("image", media_item.url, record.timestamp))
+        elif media_item.kind == "video" and media_item.url:
+            jobs.append(("video", media_item.url, record.timestamp))
+            if media_item.poster_url:
+                jobs.append(("image", media_item.poster_url, record.timestamp))
+
+    for media_item in media_items:
+        add_media_item(media_item)
+    for ref_tweet in ref_tweets:
+        for media_item in ref_tweet.media:
+            add_media_item(media_item)
+
+    deduped_jobs: List[Tuple[str, str, str]] = []
+    seen = set()
+    for kind, url, timestamp in jobs:
+        key = (kind, url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_jobs.append((kind, url, timestamp))
+    return deduped_jobs
+
+
+def media_job_is_cached(media_dir: Path, cache: Optional[Dict[str, str]], url: str) -> bool:
+    if cache is None:
+        return False
+    with IMAGE_CACHE_LOCK:
+        relative_path = cache.get(url)
+    if not relative_path:
+        return False
+    return (media_dir / Path(relative_path).name).exists()
+
+
+def repair_missing_media_from_snapshot_records(
+    records: List[SnapshotRecord],
+    asset_dir: Path,
+    workers: int,
+    resume: bool = True,
+) -> Tuple[int, int, int, int]:
+    ensure_asset_directories(asset_dir)
+    asset_dir_name = asset_dir.name
+    media_dir = asset_dir / "media"
+    image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
+
+    unique_jobs: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
+    for record in records:
+        for kind, url, timestamp in collect_snapshot_media_jobs(record):
+            unique_jobs.setdefault((kind, url), (kind, url, timestamp))
+
+    total_jobs = len(unique_jobs)
+    missing_jobs = [
+        job for job in unique_jobs.values()
+        if not media_job_is_cached(media_dir, image_cache, job[1])
+    ]
+    missing_before = len(missing_jobs)
+
+    if not missing_jobs:
+        write_media_cache(asset_dir, image_cache)
+        return total_jobs, 0, 0, 0
+
+    repaired_count = 0
+    failed_count = 0
+
+    def run_job(job: Tuple[str, str, str]) -> bool:
+        kind, url, timestamp = job
+        if kind == "image":
+            return bool(download_image_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
+        return bool(download_video_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        next_to_submit = 0
+
+        while next_to_submit < len(missing_jobs) and len(pending) < workers * 4:
+            future = executor.submit(run_job, missing_jobs[next_to_submit])
+            pending[future] = missing_jobs[next_to_submit]
+            next_to_submit += 1
+
+        completed_count = 0
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                job = pending.pop(future)
+                completed_count += 1
+                try:
+                    success = future.result()
+                except Exception:
+                    success = False
+                if success:
+                    repaired_count += 1
+                else:
+                    failed_count += 1
+
+            while next_to_submit < len(missing_jobs) and len(pending) < workers * 4:
+                future = executor.submit(run_job, missing_jobs[next_to_submit])
+                pending[future] = missing_jobs[next_to_submit]
+                next_to_submit += 1
+
+            if completed_count % 25 == 0 or completed_count == len(missing_jobs):
+                print(
+                    f"Media repair progress: {completed_count}/{len(missing_jobs)} checked, "
+                    f"{repaired_count} repaired, {failed_count} still missing",
+                    flush=True,
+                )
+
+    write_media_cache(asset_dir, image_cache)
+    missing_after = sum(
+        1 for _, url, _ in missing_jobs if not media_job_is_cached(media_dir, image_cache, url)
+    )
+    return total_jobs, missing_before, repaired_count, missing_after
+
+
 def render_snapshot_entry(
     record: SnapshotRecord,
     index: int,
@@ -2240,6 +2362,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip snapshot JSON fetching and regenerate the HTML bundle from local JSON files.",
     )
+    mode_group.add_argument(
+        "--repair-media",
+        action="store_true",
+        help="Scan local JSON snapshots for missing media files and try to download them without regenerating HTML.",
+    )
     parser.add_argument(
         "--workers",
         type=positive_int,
@@ -2265,7 +2392,7 @@ def main():
     resume = not args.no_resume
     output_path, asset_dir, _, json_dir, _ = build_output_paths(user)
 
-    if args.html_from_json:
+    if args.html_from_json or args.repair_media:
         print(f"Loading local snapshot JSON for @{user}...")
         records = load_snapshot_records(asset_dir, json_dir, user)
         if not records:
@@ -2275,15 +2402,32 @@ def main():
         if not available_records:
             print(f"No JSON snapshot files are present in {json_dir}")
             sys.exit(1)
-        print(f"Found {len(available_records)} local JSON snapshots. Rendering HTML...")
-        written_paths = build_archives_from_snapshot_records(
-            available_records,
-            user,
-            output_path,
-            asset_dir,
-            args.workers,
-            resume=resume,
-        )
+        if args.repair_media:
+            print(f"Found {len(available_records)} local JSON snapshots. Repairing missing media...")
+            total_jobs, missing_before, repaired_count, missing_after = repair_missing_media_from_snapshot_records(
+                available_records,
+                asset_dir,
+                args.workers,
+                resume=resume,
+            )
+            print(f"Unique media targets: {total_jobs}")
+            print(f"Missing before repair: {missing_before}")
+            print(f"Repaired this run: {repaired_count}")
+            print(f"Still missing after repair: {missing_after}")
+            print("Finished media repair stage.")
+            print(f"  - {media_index_path(asset_dir)}")
+            print(f"  - {asset_dir / 'media'}")
+            return
+        else:
+            print(f"Found {len(available_records)} local JSON snapshots. Rendering HTML...")
+            written_paths = build_archives_from_snapshot_records(
+                available_records,
+                user,
+                output_path,
+                asset_dir,
+                args.workers,
+                resume=resume,
+            )
     else:
         print(f"Resolving snapshot list for @{user}...")
         records, record_source = resolve_snapshot_records(

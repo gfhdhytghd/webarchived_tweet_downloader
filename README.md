@@ -43,6 +43,12 @@ Regenerate HTML from local JSON snapshots:
 python download_archive.py <twitter_username> --html-from-json
 ```
 
+Repair only missing local media assets from existing JSON snapshots:
+
+```bash
+python download_archive.py <twitter_username> --repair-media
+```
+
 Set a custom concurrency level:
 
 ```bash
@@ -61,6 +67,7 @@ Examples:
 python download_archive.py AnIncandescence
 python download_archive.py AnIncandescence --json-only --workers 24
 python download_archive.py AnIncandescence --html-from-json
+python download_archive.py AnIncandescence --repair-media --workers 12
 ```
 
 The script always writes everything into a dedicated `<username>_archive/` folder.
@@ -130,6 +137,7 @@ The downloader also writes:
 - In the default full run, tweet media is prefetched alongside snapshot JSON preparation so the streaming chronological HTML page is not waiting on media downloads at finalize time.
 - `--json-only` stops after the JSON stage and does not write HTML files.
 - `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `<username>_archive/*_archive_assets/json/` directory.
+- `--repair-media` scans local snapshot JSON files, finds media that is still missing from `<username>_archive/*_archive_assets/media/`, and tries to download only those assets without regenerating HTML.
 - Wayback responses are inconsistent; some archived captures may still fail to parse.
 - The script retries transient network failures, but very large exports can still take a while.
 - The Internet Archive may throttle aggressive traffic. If necessary, rerun the command later.
