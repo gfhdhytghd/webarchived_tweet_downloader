@@ -89,6 +89,7 @@ MIME_EXTENSION_MAP = {
     "image/gif": ".gif",
     "image/webp": ".webp",
     "image/svg+xml": ".svg",
+    "video/mp4": ".mp4",
 }
 IMAGE_CACHE_LOCK = threading.Lock()
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
@@ -256,6 +257,7 @@ p{margin:4px 0 0;font-size:15px;color:var(--ink);line-height:1.5;overflow-wrap:a
 .tweet-media{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:2px;margin:10px 0 4px;border-radius:16px;overflow:hidden}
 .tweet-media-item{width:100%}
 .tweet-media-item img{display:block;width:100%;height:auto;cursor:zoom-in;background:var(--line);transition:opacity .15s}
+.tweet-media-item video{display:block;width:100%;height:auto;background:#000}
 .tweet-media-item img:hover{opacity:.88}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
@@ -357,6 +359,14 @@ class SnapshotRecord:
     json_path: Path
 
 
+@dataclass(frozen=True)
+class TweetMediaItem:
+    kind: str
+    url: str
+    content_type: str = ""
+    poster_url: str = ""
+
+
 def normalize_text_for_entropy(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -379,7 +389,7 @@ def guess_extension(image_url: str, mime_type: str) -> str:
     return suffix if suffix else ".img"
 
 
-def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> List[str]:
+def build_asset_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[str]:
     candidates: List[str] = []
     seen = set()
 
@@ -395,9 +405,9 @@ def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> List[
         add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{url}")
         add(f"https://web.archive.org/web/{snapshot_timestamp}/{url}")
 
-    add_archive_variants(image_url)
+    add_archive_variants(asset_url)
 
-    parsed = urlparse(image_url)
+    parsed = urlparse(asset_url)
     if parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/"):
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
         suffix = Path(parsed.path).suffix.lower()
@@ -418,6 +428,14 @@ def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> List[
             add_archive_variants(normalized_url)
 
     return candidates
+
+
+def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> List[str]:
+    return build_asset_candidate_urls(image_url, snapshot_timestamp)
+
+
+def build_video_candidate_urls(video_url: str, snapshot_timestamp: str) -> List[str]:
+    return build_asset_candidate_urls(video_url, snapshot_timestamp)
 
 
 def ensure_asset_directories(asset_dir: Path) -> None:
@@ -720,7 +738,7 @@ def fetch_snapshots(user: str) -> List[Tuple[str, str]]:
     return snapshots
 
 
-def _append_photo_urls_from_entities(container: dict, image_urls: List[str]) -> None:
+def _append_photo_media_from_entities(container: dict, media_items: List[TweetMediaItem]) -> None:
     """
     Collect photo URLs from legacy Twitter entity payloads when present.
     """
@@ -734,7 +752,52 @@ def _append_photo_urls_from_entities(container: dict, image_urls: List[str]) -> 
                 continue
             media_url = media.get("media_url_https") or media.get("media_url") or media.get("url")
             if media_url:
-                image_urls.append(media_url)
+                media_items.append(TweetMediaItem(kind="image", url=media_url))
+
+
+def select_best_video_variant(media: dict) -> Optional[Tuple[str, str]]:
+    """
+    Prefer the highest bitrate MP4 variant for archived Twitter videos.
+    """
+    best_mp4: Optional[Tuple[int, str, str]] = None
+    fallback: Optional[Tuple[str, str]] = None
+
+    for variant in media.get("variants", []):
+        if not isinstance(variant, dict):
+            continue
+        url = _coerce_string(variant.get("url")).strip()
+        content_type = _coerce_string(variant.get("content_type")).strip()
+        if not url or not content_type:
+            continue
+        if fallback is None:
+            fallback = (url, content_type)
+        if content_type != "video/mp4":
+            continue
+        bit_rate = variant.get("bit_rate")
+        if not isinstance(bit_rate, int):
+            bit_rate = -1
+        candidate = (bit_rate, url, content_type)
+        if best_mp4 is None or candidate[0] > best_mp4[0]:
+            best_mp4 = candidate
+
+    if best_mp4 is not None:
+        return best_mp4[1], best_mp4[2]
+    return fallback
+
+
+def find_primary_tweet_node(data: dict, original_url: str) -> Optional[dict]:
+    target_tweet_id_match = TWEET_URL_ID_RE.search(original_url)
+    target_tweet_id = target_tweet_id_match.group(1) if target_tweet_id_match else ""
+    fallback_node: Optional[dict] = None
+
+    for node in _iter_candidate_tweet_nodes(data):
+        metadata = _extract_metadata_from_node(node)
+        if fallback_node is None and (metadata["tweet_id"] or _extract_tweet_text_from_node(node)):
+            fallback_node = node
+        if target_tweet_id and metadata["tweet_id"] == target_tweet_id:
+            return node
+
+    return fallback_node
 
 
 def _extract_note_tweet_text(container: dict) -> str:
@@ -913,12 +976,12 @@ def extract_tweet_metadata(data: dict, original_url: str) -> Dict[str, str]:
     return metadata
 
 
-def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[str], Dict[str, str]]:
+def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[TweetMediaItem], Dict[str, str]]:
     """
-    Extract visible tweet text, photo URLs, and reply metadata from a payload.
+    Extract visible tweet text, typed media items, and reply metadata from a payload.
     """
     texts: List[str] = []
-    image_urls: List[str] = []
+    media_items: List[TweetMediaItem] = []
     media_by_key: Dict[str, dict] = {}
     seen_texts = set()
 
@@ -928,14 +991,7 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[str]
             if isinstance(media, dict) and media.get("media_key"):
                 media_by_key[media["media_key"]] = media
 
-    def collect_from_node(node) -> None:
-        if isinstance(node, list):
-            for item in node:
-                collect_from_node(item)
-            return
-        if not isinstance(node, dict):
-            return
-
+    def collect_from_node(node: dict) -> None:
         text = _extract_tweet_text_from_node(node)
         if text and text not in seen_texts:
             texts.append(text)
@@ -943,41 +999,77 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[str]
 
         attachments = node.get("attachments", {})
         media_keys = attachments.get("media_keys", []) if isinstance(attachments, dict) else []
+        attachment_media = []
         for media_key in media_keys:
             media = media_by_key.get(media_key)
             if not isinstance(media, dict):
                 continue
+            attachment_media.append(media)
+
+        has_video_attachment = any(
+            media.get("type") in {"video", "animated_gif"} for media in attachment_media if isinstance(media, dict)
+        )
+        for media in attachment_media:
             media_type = media.get("type")
             if media_type == "photo" and media.get("url"):
-                image_urls.append(media["url"])
-            elif media_type in {"video", "animated_gif"} and media.get("preview_image_url"):
-                image_urls.append(media["preview_image_url"])
+                if has_video_attachment:
+                    continue
+                media_items.append(TweetMediaItem(kind="image", url=media["url"]))
+            elif media_type in {"video", "animated_gif"}:
+                variant = select_best_video_variant(media)
+                if variant:
+                    media_items.append(
+                        TweetMediaItem(
+                            kind="video",
+                            url=variant[0],
+                            content_type=variant[1],
+                            poster_url=_coerce_string(media.get("preview_image_url")).strip(),
+                        )
+                    )
+                elif media.get("preview_image_url"):
+                    media_items.append(TweetMediaItem(kind="image", url=media["preview_image_url"]))
 
-        _append_photo_urls_from_entities(node, image_urls)
+        if not attachment_media:
+            _append_photo_media_from_entities(node, media_items)
         legacy = node.get("legacy")
         if isinstance(legacy, dict):
-            _append_photo_urls_from_entities(legacy, image_urls)
+            if not attachment_media:
+                _append_photo_media_from_entities(legacy, media_items)
 
         if node.get("type") == "photo":
             photo_url = node.get("url") or node.get("media_url_https") or node.get("media_url")
             if photo_url:
-                image_urls.append(photo_url)
-        elif node.get("type") in {"video", "animated_gif"} and node.get("preview_image_url"):
-            image_urls.append(node["preview_image_url"])
+                media_items.append(TweetMediaItem(kind="image", url=photo_url))
+        elif node.get("type") in {"video", "animated_gif"}:
+            variant = select_best_video_variant(node)
+            if variant:
+                media_items.append(
+                    TweetMediaItem(
+                        kind="video",
+                        url=variant[0],
+                        content_type=variant[1],
+                        poster_url=_coerce_string(node.get("preview_image_url")).strip(),
+                    )
+                )
+            elif node.get("preview_image_url"):
+                media_items.append(TweetMediaItem(kind="image", url=node["preview_image_url"]))
 
-        for value in node.values():
-            collect_from_node(value)
+    primary_node = find_primary_tweet_node(data, original_url)
+    if primary_node is not None:
+        collect_from_node(primary_node)
+    else:
+        for node in _iter_candidate_tweet_nodes(data):
+            collect_from_node(node)
 
-    collect_from_node(data)
-
-    deduped_image_urls: List[str] = []
+    deduped_media_items: List[TweetMediaItem] = []
     seen = set()
-    for image_url in image_urls:
-        if image_url and image_url not in seen:
-            deduped_image_urls.append(image_url)
-            seen.add(image_url)
+    for media_item in media_items:
+        dedupe_key = (media_item.kind, media_item.url)
+        if media_item.url and dedupe_key not in seen:
+            deduped_media_items.append(media_item)
+            seen.add(dedupe_key)
 
-    return "\n".join(texts), deduped_image_urls, extract_tweet_metadata(data, original_url)
+    return "\n".join(texts), deduped_media_items, extract_tweet_metadata(data, original_url)
 
 
 def fetch_snapshot_json(snapshot_timestamp: str, original_url: str) -> str:
@@ -1114,6 +1206,53 @@ def download_image_asset(
     return relative_path
 
 
+def download_video_asset(
+    video_url: str,
+    snapshot_timestamp: str,
+    media_dir: Path,
+    asset_dir_name: str,
+    cache: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    Download one archived video variant and return its relative asset path.
+    """
+    with IMAGE_CACHE_LOCK:
+        if cache is not None and video_url in cache:
+            cached_relative_path = cache[video_url]
+            if (media_dir / Path(cached_relative_path).name).exists():
+                return cached_relative_path
+            cache.pop(video_url, None)
+
+    candidate_urls = build_video_candidate_urls(video_url, snapshot_timestamp)
+    resp = None
+    for candidate_url in candidate_urls:
+        try:
+            resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
+            break
+        except Exception:
+            resp = None
+    if resp is None:
+        return ""
+
+    mime_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip()
+    if not mime_type.startswith("video/"):
+        guessed_mime = mimetypes.guess_type(video_url)[0] or ""
+        mime_type = guessed_mime if guessed_mime.startswith("video/") else "video/mp4"
+
+    extension = guess_extension(video_url, mime_type)
+    digest = hashlib.sha256(resp.content).hexdigest()[:24]
+    filename = f"{digest}{extension}"
+    destination = media_dir / filename
+
+    with IMAGE_CACHE_LOCK:
+        if not destination.exists():
+            destination.write_bytes(resp.content)
+        relative_path = f"{asset_dir_name}/media/{filename}"
+        if cache is not None:
+            cache[video_url] = relative_path
+    return relative_path
+
+
 def prefetch_snapshot_media(
     record: SnapshotRecord,
     asset_dir_name: str,
@@ -1124,9 +1263,14 @@ def prefetch_snapshot_media(
     if data is None:
         return
 
-    _, image_urls, _ = extract_tweet_content(data, record.original_url)
-    for image_url in image_urls:
-        download_image_asset(image_url, record.timestamp, media_dir, asset_dir_name, image_cache)
+    _, media_items, _ = extract_tweet_content(data, record.original_url)
+    for media_item in media_items:
+        if media_item.kind == "image":
+            download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+        elif media_item.kind == "video":
+            download_video_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            if media_item.poster_url:
+                download_image_asset(media_item.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache)
 
 
 def render_snapshot_entry(
@@ -1150,8 +1294,8 @@ def render_snapshot_entry(
     if data is None:
         return None
 
-    text, image_urls, metadata = extract_tweet_content(data, record.original_url)
-    if not text and not image_urls:
+    text, media_items, metadata = extract_tweet_content(data, record.original_url)
+    if not text and not media_items:
         return None
 
     safe_text = html.escape(text).replace("\n", "<br/>\n")
@@ -1161,13 +1305,38 @@ def render_snapshot_entry(
     tweet_attrs = build_tweet_data_attributes(metadata, json_relative_path)
 
     media_html_parts = []
-    for image_url in image_urls:
-        image_path = download_image_asset(image_url, record.timestamp, media_dir, asset_dir_name, image_cache)
-        if not image_path:
+    for media_item in media_items:
+        if media_item.kind == "image":
+            image_path = download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            if not image_path:
+                continue
+            media_html_parts.append(
+                f"  <div class='tweet-media-item'><img src='{html.escape(image_path)}' alt='Archived media from tweet captured on {html.escape(dt)}' loading='lazy' decoding='async'/></div>\n"
+            )
             continue
-        media_html_parts.append(
-            f"  <div class='tweet-media-item'><img src='{html.escape(image_path)}' alt='Archived media from tweet captured on {html.escape(dt)}' loading='lazy' decoding='async'/></div>\n"
-        )
+        if media_item.kind == "video":
+            video_path = download_video_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            if not video_path:
+                continue
+            poster_attr = ""
+            if media_item.poster_url:
+                poster_path = download_image_asset(
+                    media_item.poster_url,
+                    record.timestamp,
+                    media_dir,
+                    asset_dir_name,
+                    image_cache,
+                )
+                if poster_path:
+                    poster_attr = f" poster='{html.escape(poster_path)}'"
+            mime_type = media_item.content_type or "video/mp4"
+            media_html_parts.append(
+                "  <div class='tweet-media-item'>"
+                f"<video class='tweet-video' controls preload='metadata' playsinline{poster_attr}>"
+                f"<source src='{html.escape(video_path)}' type='{html.escape(mime_type)}'/>"
+                "Your browser does not support the video tag."
+                "</video></div>\n"
+            )
 
     media_html = ""
     if media_html_parts:
