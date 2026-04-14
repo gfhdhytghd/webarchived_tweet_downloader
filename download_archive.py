@@ -249,6 +249,14 @@ html{-webkit-text-size-adjust:100%}
 body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);line-height:1.5}
 .archive-shell{max-width:600px;margin:0 auto;border-left:1px solid var(--line);border-right:1px solid var(--line);min-height:100vh}
 .archive-header{padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(255,255,255,.85);backdrop-filter:blur(12px);z-index:10}
+.profile{padding:16px;border-bottom:1px solid var(--line)}
+.profile-avatar{width:80px;height:80px;border-radius:50%;object-fit:cover;background:var(--line)}
+.profile-name{margin-top:10px;font-size:20px;font-weight:800;line-height:1.2}
+.profile-handle{font-size:14px;color:var(--muted)}
+.profile-bio{margin:10px 0 0;font-size:15px;line-height:1.45}
+.profile-location{display:inline-block;margin-top:8px;font-size:13px;color:var(--muted)}
+.profile-stats{display:flex;gap:16px;margin-top:10px;font-size:14px;color:var(--muted)}
+.profile-stats strong{color:var(--ink);font-weight:700}
 .archive-badge{display:none}
 .archive-title{font-size:20px;font-weight:700;line-height:1.3;letter-spacing:normal}
 .archive-subtitle{margin:2px 0 0;color:var(--muted);font-size:13px;line-height:1.4}
@@ -375,6 +383,17 @@ class TweetMediaItem:
     url: str
     content_type: str = ""
     poster_url: str = ""
+
+
+@dataclass(frozen=True)
+class UserProfile:
+    username: str
+    display_name: str
+    description: str
+    location: str
+    avatar_url: str
+    followers: int
+    following: int
 
 
 @dataclass(frozen=True)
@@ -1623,14 +1642,80 @@ def render_snapshot_entry(
     )
 
 
-def render_document_start(user: str, total: int, asset_dir_name: str, title_suffix: str = "") -> str:
+def extract_user_profile(user: str, json_dir: Path) -> Optional[UserProfile]:
+    """Scan JSON files and return the most up-to-date profile for the target user."""
+    best: Optional[dict] = None
+    best_followers = -1
+    for json_path in json_dir.glob("*.json"):
+        data = load_snapshot_json(json_path)
+        if data is None:
+            continue
+        includes = data.get("includes", {})
+        if not isinstance(includes, dict):
+            continue
+        for u in includes.get("users", []):
+            if not isinstance(u, dict):
+                continue
+            if _coerce_string(u.get("username")).lower() != user.lower():
+                continue
+            fc = 0
+            pm = u.get("public_metrics")
+            if isinstance(pm, dict):
+                fc = pm.get("followers_count", 0) or 0
+            if fc > best_followers:
+                best_followers = fc
+                best = u
+    if best is None:
+        return None
+    pm = best.get("public_metrics", {}) if isinstance(best.get("public_metrics"), dict) else {}
+    avatar_url = _coerce_string(best.get("profile_image_url"))
+    # Request higher resolution avatar (400x400 instead of 48x48 _normal)
+    if avatar_url:
+        avatar_url = avatar_url.replace("_normal.", "_400x400.")
+    return UserProfile(
+        username=_coerce_string(best.get("username")),
+        display_name=_coerce_string(best.get("name")),
+        description=_coerce_string(best.get("description")),
+        location=_coerce_string(best.get("location")),
+        avatar_url=avatar_url,
+        followers=pm.get("followers_count", 0) or 0,
+        following=pm.get("following_count", 0) or 0,
+    )
+
+
+def render_document_start(user: str, total: int, asset_dir_name: str, title_suffix: str = "", profile: Optional[UserProfile] = None, avatar_path: str = "") -> str:
     title = f"Archived tweets of @{user}"
     if title_suffix:
         title = f"{title} ({title_suffix})"
     tweet_word = "tweet" if total == 1 else "tweets"
-    subtitle = (
-        f"{total} archived {tweet_word}"
-    )
+    subtitle = f"{total} archived {tweet_word}"
+
+    profile_html = ""
+    if profile:
+        avatar_html = ""
+        if avatar_path:
+            avatar_html = f"    <img class='profile-avatar' src='{html.escape(avatar_path)}' alt='' />\n"
+        name_html = f"    <div class='profile-name'>{html.escape(profile.display_name)}</div>\n" if profile.display_name else ""
+        handle_html = f"    <div class='profile-handle'>@{html.escape(profile.username)}</div>\n" if profile.username else ""
+        bio_html = f"    <p class='profile-bio'>{html.escape(profile.description)}</p>\n" if profile.description else ""
+        location_html = f"    <span class='profile-location'>{html.escape(profile.location)}</span>\n" if profile.location else ""
+        stats_html = (
+            "    <div class='profile-stats'>\n"
+            f"      <span><strong>{profile.following}</strong> Following</span>\n"
+            f"      <span><strong>{profile.followers}</strong> Followers</span>\n"
+            "    </div>\n"
+        )
+        profile_html = (
+            "  <div class='profile'>\n"
+            f"{avatar_html}"
+            f"{name_html}"
+            f"{handle_html}"
+            f"{bio_html}"
+            f"{location_html}"
+            f"{stats_html}"
+            "  </div>\n"
+        )
+
     return (
         "<!DOCTYPE html>\n"
         "<html lang='en'>\n"
@@ -1642,8 +1727,8 @@ def render_document_start(user: str, total: int, asset_dir_name: str, title_suff
         "</head>\n"
         "<body>\n"
         "<div class='archive-shell'>\n"
+        f"{profile_html}"
         "  <header class='archive-header'>\n"
-        "    <span class='archive-badge'>Wayback Archive</span>\n"
         f"    <h1 class='archive-title'>{html.escape(title)}</h1>\n"
         f"    <p class='archive-subtitle'>{html.escape(subtitle)}</p>\n"
         "  </header>\n"
@@ -1706,7 +1791,7 @@ def render_index_document(user: str, total: int, output_path: Path) -> str:
         "  <section class='grid'>\n"
         f"{card_html}\n"
         "  </section>\n"
-        "  <p class='footer'>Auto-generated index</p>\n"
+        "  <p class='footer'>Generated by <a href='https://github.com/gfhdhytghd/webarchived_tweet_downloader'>webarchived_tweet_downloader</a></p>\n"
         "</main>\n"
         "</body>\n"
         "</html>\n"
@@ -1725,9 +1810,11 @@ def write_archive_html(
     output_path: Path,
     asset_dir_name: str,
     title_suffix: str = "",
+    profile: Optional[UserProfile] = None,
+    avatar_path: str = "",
 ) -> None:
     with output_path.open("w", encoding="utf-8") as f:
-        f.write(render_document_start(user, len(entries), asset_dir_name, title_suffix))
+        f.write(render_document_start(user, len(entries), asset_dir_name, title_suffix, profile=profile, avatar_path=avatar_path))
         for entry in entries:
             f.write(entry.block)
         f.write(render_document_end(asset_dir_name))
@@ -1760,16 +1847,18 @@ def write_additional_archive_outputs(
     user: str,
     output_path: Path,
     asset_dir_name: str,
+    profile: Optional[UserProfile] = None,
+    avatar_path: str = "",
 ) -> List[Path]:
     written_paths: List[Path] = []
     for mode, title_suffix, target in get_archive_output_jobs(output_path)[1:]:
-        write_archive_html(sort_entries(entries, mode), user, target, asset_dir_name, title_suffix)
+        write_archive_html(sort_entries(entries, mode), user, target, asset_dir_name, title_suffix, profile=profile, avatar_path=avatar_path)
         written_paths.append(target)
     written_paths.append(write_index_html(user, len(entries), output_path))
     return written_paths
 
 
-def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_path: Path, asset_dir_name: str) -> List[Path]:
+def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_path: Path, asset_dir_name: str, profile: Optional[UserProfile] = None, avatar_path: str = "") -> List[Path]:
     chronological_mode, chronological_suffix, chronological_target = get_archive_output_jobs(output_path)[0]
     write_archive_html(
         sort_entries(entries, chronological_mode),
@@ -1777,8 +1866,10 @@ def write_all_archive_outputs(entries: List[ArchiveEntry], user: str, output_pat
         chronological_target,
         asset_dir_name,
         chronological_suffix,
+        profile=profile,
+        avatar_path=avatar_path,
     )
-    return [chronological_target] + write_additional_archive_outputs(entries, user, output_path, asset_dir_name)
+    return [chronological_target] + write_additional_archive_outputs(entries, user, output_path, asset_dir_name, profile=profile, avatar_path=avatar_path)
 
 
 def download_snapshot_records(
@@ -1927,6 +2018,12 @@ def build_archives_from_snapshot_records(
     asset_dir_name = asset_dir.name
     image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
 
+    json_dir = asset_dir / "json"
+    profile = extract_user_profile(user, json_dir)
+    avatar_path = ""
+    if profile and profile.avatar_url:
+        avatar_path = download_image_asset(profile.avatar_url, "", media_dir, asset_dir_name, image_cache)
+
     total = len(records)
     next_to_submit = 0
     next_to_finalize = 0
@@ -1987,7 +2084,7 @@ def build_archives_from_snapshot_records(
 
     write_media_cache(asset_dir, image_cache)
     print(f"Archive entries rendered: {rendered_count}/{total}")
-    return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name)
+    return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name, profile=profile, avatar_path=avatar_path)
 
 
 def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Path, asset_dir: Path, workers: int, resume: bool = True) -> List[Path]:
