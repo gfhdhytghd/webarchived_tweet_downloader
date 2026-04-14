@@ -57,6 +57,7 @@ import random
 import re
 import threading
 import time
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -376,6 +377,47 @@ def guess_extension(image_url: str, mime_type: str) -> str:
         return MIME_EXTENSION_MAP[guessed]
     suffix = Path(image_url.split("?", 1)[0]).suffix
     return suffix if suffix else ".img"
+
+
+def build_image_candidate_urls(image_url: str, snapshot_timestamp: str) -> List[str]:
+    candidates: List[str] = []
+    seen = set()
+
+    def add(url: str) -> None:
+        if not url or url in seen:
+            return
+        seen.add(url)
+        candidates.append(url)
+
+    def add_archive_variants(url: str) -> None:
+        add(url)
+        add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{url}")
+        add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{url}")
+        add(f"https://web.archive.org/web/{snapshot_timestamp}/{url}")
+
+    add_archive_variants(image_url)
+
+    parsed = urlparse(image_url)
+    if parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/"):
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        suffix = Path(parsed.path).suffix.lower()
+        format_hint = query.get("format", "")
+        normalized_path = parsed.path
+
+        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+            format_hint = format_hint or suffix.lstrip(".")
+            normalized_path = parsed.path[: -len(suffix)]
+
+        if format_hint:
+            normalized_query = dict(query)
+            normalized_query["format"] = format_hint
+            normalized_query.setdefault("name", "orig")
+            normalized_url = urlunparse(
+                parsed._replace(path=normalized_path, query=urlencode(normalized_query))
+            )
+            add_archive_variants(normalized_url)
+
+    return candidates
 
 
 def ensure_asset_directories(asset_dir: Path) -> None:
@@ -1042,7 +1084,7 @@ def download_image_asset(
                 return cached_relative_path
             cache.pop(image_url, None)
 
-    candidate_urls = [image_url, f"https://web.archive.org/web/{snapshot_timestamp}im_/{image_url}"]
+    candidate_urls = build_image_candidate_urls(image_url, snapshot_timestamp)
     resp = None
     for candidate_url in candidate_urls:
         try:
