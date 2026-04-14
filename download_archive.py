@@ -91,7 +91,7 @@ MIME_EXTENSION_MAP = {
     "image/svg+xml": ".svg",
     "video/mp4": ".mp4",
 }
-IMAGE_CACHE_LOCK = threading.Lock()
+IMAGE_CACHE_LOCK = threading.RLock()
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
 MEDIA_INDEX_NAME = "media_index.json"
 ARCHIVE_FILTER_CSS = """
@@ -259,6 +259,13 @@ p{margin:4px 0 0;font-size:15px;color:var(--ink);line-height:1.5;overflow-wrap:a
 .tweet-media-item img{display:block;width:100%;height:auto;cursor:zoom-in;background:var(--line);transition:opacity .15s}
 .tweet-media-item video{display:block;width:100%;height:auto;background:#000}
 .tweet-media-item img:hover{opacity:.88}
+.tweet-ref{margin:10px 0 4px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--bg)}
+.tweet-ref p{margin:4px 0 0;font-size:14px;color:var(--ink);line-height:1.45}
+.tweet-ref-header{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.tweet-ref-name{font-size:14px;font-weight:700;color:var(--ink)}
+.tweet-ref-handle{font-size:13px;color:var(--muted)}
+.tweet-ref-time{display:block;margin-top:6px;font-size:12px;color:var(--muted)}
+.tweet-ref .tweet-media{margin:8px 0 4px;border-radius:12px}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 .lightbox{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.7);cursor:pointer}
@@ -368,10 +375,14 @@ class TweetMediaItem:
 
 
 @dataclass(frozen=True)
-class QuotedTweetInfo:
+class ReferencedTweetInfo:
+    kind: str  # "quoted" or "replied_to"
     text: str
     author: str
+    display_name: str
+    created_at: str
     url: str
+    media: Tuple["TweetMediaItem", ...] = ()
 
 
 def normalize_text_for_entropy(text: str) -> str:
@@ -629,10 +640,18 @@ def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
 
 
 def write_media_cache(asset_dir: Path, cache: Dict[str, str]) -> None:
-    media_index_path(asset_dir).write_text(
-        json.dumps(dict(sorted(cache.items())), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    cache_path = media_index_path(asset_dir)
+    with IMAGE_CACHE_LOCK:
+        payload = json.dumps(dict(sorted(cache.items())), ensure_ascii=False, indent=2) + "\n"
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        tmp_path.replace(cache_path)
+
+
+def persist_media_cache_entry(media_dir: Path, cache: Optional[Dict[str, str]]) -> None:
+    if cache is None:
+        return
+    write_media_cache(media_dir.parent, cache)
 
 
 def sort_entries(entries: List[ArchiveEntry], mode: str) -> List[ArchiveEntry]:
@@ -807,14 +826,15 @@ def find_primary_tweet_node(data: dict, original_url: str) -> Optional[dict]:
     return fallback_node
 
 
-def find_quoted_tweet_nodes(data: dict, primary_node: dict) -> List[dict]:
+def _find_referenced_tweet_nodes(data: dict, primary_node: dict, ref_type: str) -> List[dict]:
+    """Find referenced tweet nodes by type ('quoted' or 'replied_to')."""
     referenced = primary_node.get("referenced_tweets", [])
-    quoted_ids = {
+    target_ids = {
         _coerce_string(item.get("id")).strip()
         for item in referenced
-        if isinstance(item, dict) and item.get("type") == "quoted" and _coerce_string(item.get("id")).strip()
+        if isinstance(item, dict) and item.get("type") == ref_type and _coerce_string(item.get("id")).strip()
     }
-    if not quoted_ids:
+    if not target_ids:
         return []
 
     matches: List[dict] = []
@@ -826,23 +846,31 @@ def find_quoted_tweet_nodes(data: dict, primary_node: dict) -> List[dict]:
             continue
         metadata = _extract_metadata_from_node(node)
         tweet_id = metadata.get("tweet_id", "")
-        if tweet_id in quoted_ids and tweet_id not in seen_ids:
+        if tweet_id in target_ids and tweet_id not in seen_ids:
             matches.append(node)
             seen_ids.add(tweet_id)
 
-    if seen_ids == quoted_ids:
+    if seen_ids == target_ids:
         return matches
 
     for node in _iter_candidate_tweet_nodes(data):
         metadata = _extract_metadata_from_node(node)
         tweet_id = metadata.get("tweet_id", "")
-        if tweet_id in quoted_ids and tweet_id not in seen_ids:
+        if tweet_id in target_ids and tweet_id not in seen_ids:
             matches.append(node)
             seen_ids.add(tweet_id)
-            if seen_ids == quoted_ids:
+            if seen_ids == target_ids:
                 break
 
     return matches
+
+
+def find_quoted_tweet_nodes(data: dict, primary_node: dict) -> List[dict]:
+    return _find_referenced_tweet_nodes(data, primary_node, "quoted")
+
+
+def find_replied_to_tweet_nodes(data: dict, primary_node: dict) -> List[dict]:
+    return _find_referenced_tweet_nodes(data, primary_node, "replied_to")
 
 
 def _extract_note_tweet_text(container: dict) -> str:
@@ -1021,14 +1049,95 @@ def extract_tweet_metadata(data: dict, original_url: str) -> Dict[str, str]:
     return metadata
 
 
-def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[TweetMediaItem], Dict[str, str]]:
+def _find_quote_tco_urls(node: dict) -> set:
+    """Return the set of t.co short URLs that point to quoted tweets."""
+    referenced = node.get("referenced_tweets", [])
+    quoted_ids = {
+        _coerce_string(item.get("id")).strip()
+        for item in referenced
+        if isinstance(item, dict) and item.get("type") == "quoted" and _coerce_string(item.get("id")).strip()
+    }
+    if not quoted_ids:
+        return set()
+
+    tco_urls: set = set()
+    for entity_block_key in ("entities", "extended_entities"):
+        entity_block = node.get(entity_block_key, {})
+        if not isinstance(entity_block, dict):
+            continue
+        for url_entity in entity_block.get("urls", []):
+            if not isinstance(url_entity, dict):
+                continue
+            expanded = url_entity.get("expanded_url", "")
+            tco = url_entity.get("url", "")
+            if not tco or not expanded:
+                continue
+            for qid in quoted_ids:
+                if qid in expanded:
+                    tco_urls.add(tco)
+                    break
+    legacy = node.get("legacy")
+    if isinstance(legacy, dict):
+        for entity_block_key in ("entities", "extended_entities"):
+            entity_block = legacy.get(entity_block_key, {})
+            if not isinstance(entity_block, dict):
+                continue
+            for url_entity in entity_block.get("urls", []):
+                if not isinstance(url_entity, dict):
+                    continue
+                expanded = url_entity.get("expanded_url", "")
+                tco = url_entity.get("url", "")
+                if not tco or not expanded:
+                    continue
+                for qid in quoted_ids:
+                    if qid in expanded:
+                        tco_urls.add(tco)
+                        break
+    return tco_urls
+
+
+def _strip_tco_urls(text: str, tco_urls: set) -> str:
+    for tco in tco_urls:
+        text = text.replace(tco, "")
+    return text.strip()
+
+
+def _extract_user_info(data: dict, node: dict) -> Tuple[str, str]:
+    """Return (screen_name, display_name) for a tweet node's author."""
+    author_id = _coerce_string(node.get("author_id"))
+    includes = data.get("includes", {})
+    if isinstance(includes, dict):
+        for user in includes.get("users", []):
+            if isinstance(user, dict):
+                uid = _coerce_string(user.get("id"))
+                if author_id and uid == author_id:
+                    return (
+                        _coerce_string(user.get("username") or user.get("screen_name")),
+                        _coerce_string(user.get("name")),
+                    )
+    legacy = node.get("legacy") if isinstance(node.get("legacy"), dict) else {}
+    user_block = node.get("core", {}).get("user_results", {}).get("result", {})
+    if isinstance(user_block, dict):
+        ul = user_block.get("legacy", {})
+        if isinstance(ul, dict):
+            sn = _coerce_string(ul.get("screen_name"))
+            dn = _coerce_string(ul.get("name"))
+            if sn:
+                return sn, dn
+    screen_name = _coerce_string(node.get("screen_name") or legacy.get("screen_name"))
+    display_name = _coerce_string(node.get("name") or legacy.get("name"))
+    return screen_name, display_name
+
+
+def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[TweetMediaItem], Dict[str, str], List[ReferencedTweetInfo]]:
     """
-    Extract visible tweet text, typed media items, and reply metadata from a payload.
+    Extract visible tweet text, typed media items, reply metadata, and quoted tweets from a payload.
     """
     texts: List[str] = []
     media_items: List[TweetMediaItem] = []
     media_by_key: Dict[str, dict] = {}
     seen_texts = set()
+    ref_tweets: List[ReferencedTweetInfo] = []
 
     includes = data.get("includes", {})
     if isinstance(includes, dict):
@@ -1042,7 +1151,8 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
             texts.append(text)
             seen_texts.add(text)
 
-    def collect_media_from_node(node: dict) -> None:
+    def collect_media_from_node(node: dict, target: Optional[List[TweetMediaItem]] = None) -> None:
+        dest = target if target is not None else media_items
         attachments = node.get("attachments", {})
         media_keys = attachments.get("media_keys", []) if isinstance(attachments, dict) else []
         attachment_media = []
@@ -1055,11 +1165,11 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
         for media in attachment_media:
             media_type = media.get("type")
             if media_type == "photo" and media.get("url"):
-                media_items.append(TweetMediaItem(kind="image", url=media["url"]))
+                dest.append(TweetMediaItem(kind="image", url=media["url"]))
             elif media_type in {"video", "animated_gif"}:
                 variant = select_best_video_variant(media)
                 if variant:
-                    media_items.append(
+                    dest.append(
                         TweetMediaItem(
                             kind="video",
                             url=variant[0],
@@ -1068,23 +1178,23 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
                         )
                     )
                 elif media.get("preview_image_url"):
-                    media_items.append(TweetMediaItem(kind="image", url=media["preview_image_url"]))
+                    dest.append(TweetMediaItem(kind="image", url=media["preview_image_url"]))
 
         if not attachment_media:
-            _append_photo_media_from_entities(node, media_items)
+            _append_photo_media_from_entities(node, dest)
         legacy = node.get("legacy")
         if isinstance(legacy, dict):
             if not attachment_media:
-                _append_photo_media_from_entities(legacy, media_items)
+                _append_photo_media_from_entities(legacy, dest)
 
         if node.get("type") == "photo":
             photo_url = node.get("url") or node.get("media_url_https") or node.get("media_url")
             if photo_url:
-                media_items.append(TweetMediaItem(kind="image", url=photo_url))
+                dest.append(TweetMediaItem(kind="image", url=photo_url))
         elif node.get("type") in {"video", "animated_gif"}:
             variant = select_best_video_variant(node)
             if variant:
-                media_items.append(
+                dest.append(
                     TweetMediaItem(
                         kind="video",
                         url=variant[0],
@@ -1093,14 +1203,31 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
                     )
                 )
             elif node.get("preview_image_url"):
-                media_items.append(TweetMediaItem(kind="image", url=node["preview_image_url"]))
+                dest.append(TweetMediaItem(kind="image", url=node["preview_image_url"]))
 
+    quote_tco_urls: set = set()
     primary_node = find_primary_tweet_node(data, original_url)
     if primary_node is not None:
+        quote_tco_urls = _find_quote_tco_urls(primary_node)
         collect_text_from_node(primary_node)
         collect_media_from_node(primary_node)
-        for quoted_node in find_quoted_tweet_nodes(data, primary_node):
-            collect_media_from_node(quoted_node)
+        for ref_type in ("replied_to", "quoted"):
+            finder = find_replied_to_tweet_nodes if ref_type == "replied_to" else find_quoted_tweet_nodes
+            for ref_node in finder(data, primary_node):
+                rt_media: List[TweetMediaItem] = []
+                collect_media_from_node(ref_node, target=rt_media)
+                rt_text = _extract_tweet_text_from_node(ref_node)
+                rt_author, rt_display_name = _extract_user_info(data, ref_node)
+                rt_meta = _extract_metadata_from_node(ref_node)
+                rt_id = rt_meta.get("tweet_id", "")
+                rt_url = f"https://twitter.com/{rt_author}/status/{rt_id}" if rt_author and rt_id else ""
+                rt_created = _coerce_string(ref_node.get("created_at"))
+                if rt_text or rt_media:
+                    ref_tweets.append(ReferencedTweetInfo(
+                        kind=ref_type, text=rt_text, author=rt_author,
+                        display_name=rt_display_name, created_at=rt_created,
+                        url=rt_url, media=tuple(rt_media),
+                    ))
     else:
         for node in _iter_candidate_tweet_nodes(data):
             collect_text_from_node(node)
@@ -1114,7 +1241,11 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
             deduped_media_items.append(media_item)
             seen.add(dedupe_key)
 
-    return "\n".join(texts), deduped_media_items, extract_tweet_metadata(data, original_url)
+    combined_text = "\n".join(texts)
+    if quote_tco_urls:
+        combined_text = _strip_tco_urls(combined_text, quote_tco_urls)
+
+    return combined_text, deduped_media_items, extract_tweet_metadata(data, original_url), ref_tweets
 
 
 def fetch_snapshot_json(snapshot_timestamp: str, original_url: str) -> str:
@@ -1248,6 +1379,7 @@ def download_image_asset(
         relative_path = f"{asset_dir_name}/media/{filename}"
         if cache is not None:
             cache[image_url] = relative_path
+            persist_media_cache_entry(media_dir, cache)
     return relative_path
 
 
@@ -1295,6 +1427,7 @@ def download_video_asset(
         relative_path = f"{asset_dir_name}/media/{filename}"
         if cache is not None:
             cache[video_url] = relative_path
+            persist_media_cache_entry(media_dir, cache)
     return relative_path
 
 
@@ -1308,8 +1441,11 @@ def prefetch_snapshot_media(
     if data is None:
         return
 
-    _, media_items, _ = extract_tweet_content(data, record.original_url)
-    for media_item in media_items:
+    _, media_items, _, ref_tweets = extract_tweet_content(data, record.original_url)
+    all_media = list(media_items)
+    for qt in ref_tweets:
+        all_media.extend(qt.media)
+    for media_item in all_media:
         if media_item.kind == "image":
             download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
         elif media_item.kind == "video":
@@ -1339,7 +1475,7 @@ def render_snapshot_entry(
     if data is None:
         return None
 
-    text, media_items, metadata = extract_tweet_content(data, record.original_url)
+    text, media_items, metadata, ref_tweets = extract_tweet_content(data, record.original_url)
     if not text and not media_items:
         return None
 
@@ -1387,8 +1523,53 @@ def render_snapshot_entry(
     if media_html_parts:
         media_html = "  <div class='tweet-media'>\n" + "".join(media_html_parts) + "  </div>\n"
 
+    quote_html = ""
+    for rt in ref_tweets:
+        rt_safe_text = html.escape(rt.text).replace("\n", "<br/>\n")
+        # Author header: display name + @username
+        rt_header_parts = []
+        if rt.display_name:
+            rt_header_parts.append(f"<span class='tweet-ref-name'>{html.escape(rt.display_name)}</span>")
+        if rt.author:
+            rt_header_parts.append(f"<span class='tweet-ref-handle'>@{html.escape(rt.author)}</span>")
+        rt_header_html = f"    <div class='tweet-ref-header'>{' '.join(rt_header_parts)}</div>\n" if rt_header_parts else ""
+        rt_text_html = f"    <p>{rt_safe_text}</p>\n" if rt_safe_text else ""
+        rt_media_parts = []
+        for rm in rt.media:
+            if rm.kind == "image":
+                rm_path = download_image_asset(rm.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                if rm_path:
+                    rt_media_parts.append(
+                        f"      <div class='tweet-media-item'><img src='{html.escape(rm_path)}' loading='lazy' decoding='async'/></div>\n"
+                    )
+            elif rm.kind == "video":
+                rm_path = download_video_asset(rm.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                if rm_path:
+                    rm_poster = ""
+                    if rm.poster_url:
+                        pp = download_image_asset(rm.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                        if pp:
+                            rm_poster = f" poster='{html.escape(pp)}'"
+                    rm_mime = rm.content_type or "video/mp4"
+                    rt_media_parts.append(
+                        f"      <div class='tweet-media-item'><video class='tweet-video' controls preload='metadata' playsinline{rm_poster}>"
+                        f"<source src='{html.escape(rm_path)}' type='{html.escape(rm_mime)}'/></video></div>\n"
+                    )
+        rt_media_html = ""
+        if rt_media_parts:
+            rt_media_html = "    <div class='tweet-media'>\n" + "".join(rt_media_parts) + "    </div>\n"
+        rt_time_html = f"    <span class='tweet-ref-time'>{html.escape(rt.created_at)}</span>\n" if rt.created_at else ""
+        quote_html += (
+            f"  <blockquote class='tweet-ref tweet-ref-{rt.kind}'>\n"
+            f"{rt_header_html}"
+            f"{rt_text_html}"
+            f"{rt_media_html}"
+            f"{rt_time_html}"
+            "  </blockquote>\n"
+        )
+
     block = (
-        f"<div class='tweet' {tweet_attrs}>\n  <h3>{dt}</h3>\n{text_html}{media_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
+        f"<div class='tweet' {tweet_attrs}>\n  <h3>{dt}</h3>\n{text_html}{media_html}{quote_html}  <p><a href='{safe_url}'>View original tweet</a></p>\n</div>\n"
     )
     return ArchiveEntry(
         block=block,
