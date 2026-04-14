@@ -367,6 +367,13 @@ class TweetMediaItem:
     poster_url: str = ""
 
 
+@dataclass(frozen=True)
+class QuotedTweetInfo:
+    text: str
+    author: str
+    url: str
+
+
 def normalize_text_for_entropy(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -744,8 +751,8 @@ def _append_photo_media_from_entities(container: dict, media_items: List[TweetMe
     """
     for entity_key in ("extended_entities", "entities"):
         entity_block = container.get(entity_key, {})
-        media_items = entity_block.get("media", []) if isinstance(entity_block, dict) else []
-        for media in media_items:
+        entity_media_items = entity_block.get("media", []) if isinstance(entity_block, dict) else []
+        for media in entity_media_items:
             if not isinstance(media, dict):
                 continue
             if media.get("type") != "photo":
@@ -798,6 +805,44 @@ def find_primary_tweet_node(data: dict, original_url: str) -> Optional[dict]:
             return node
 
     return fallback_node
+
+
+def find_quoted_tweet_nodes(data: dict, primary_node: dict) -> List[dict]:
+    referenced = primary_node.get("referenced_tweets", [])
+    quoted_ids = {
+        _coerce_string(item.get("id")).strip()
+        for item in referenced
+        if isinstance(item, dict) and item.get("type") == "quoted" and _coerce_string(item.get("id")).strip()
+    }
+    if not quoted_ids:
+        return []
+
+    matches: List[dict] = []
+    seen_ids = set()
+    includes = data.get("includes", {})
+    tweets = includes.get("tweets", []) if isinstance(includes, dict) else []
+    for node in tweets:
+        if not isinstance(node, dict):
+            continue
+        metadata = _extract_metadata_from_node(node)
+        tweet_id = metadata.get("tweet_id", "")
+        if tweet_id in quoted_ids and tweet_id not in seen_ids:
+            matches.append(node)
+            seen_ids.add(tweet_id)
+
+    if seen_ids == quoted_ids:
+        return matches
+
+    for node in _iter_candidate_tweet_nodes(data):
+        metadata = _extract_metadata_from_node(node)
+        tweet_id = metadata.get("tweet_id", "")
+        if tweet_id in quoted_ids and tweet_id not in seen_ids:
+            matches.append(node)
+            seen_ids.add(tweet_id)
+            if seen_ids == quoted_ids:
+                break
+
+    return matches
 
 
 def _extract_note_tweet_text(container: dict) -> str:
@@ -991,12 +1036,13 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
             if isinstance(media, dict) and media.get("media_key"):
                 media_by_key[media["media_key"]] = media
 
-    def collect_from_node(node: dict) -> None:
+    def collect_text_from_node(node: dict) -> None:
         text = _extract_tweet_text_from_node(node)
         if text and text not in seen_texts:
             texts.append(text)
             seen_texts.add(text)
 
+    def collect_media_from_node(node: dict) -> None:
         attachments = node.get("attachments", {})
         media_keys = attachments.get("media_keys", []) if isinstance(attachments, dict) else []
         attachment_media = []
@@ -1006,14 +1052,9 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
                 continue
             attachment_media.append(media)
 
-        has_video_attachment = any(
-            media.get("type") in {"video", "animated_gif"} for media in attachment_media if isinstance(media, dict)
-        )
         for media in attachment_media:
             media_type = media.get("type")
             if media_type == "photo" and media.get("url"):
-                if has_video_attachment:
-                    continue
                 media_items.append(TweetMediaItem(kind="image", url=media["url"]))
             elif media_type in {"video", "animated_gif"}:
                 variant = select_best_video_variant(media)
@@ -1056,10 +1097,14 @@ def extract_tweet_content(data: dict, original_url: str) -> Tuple[str, List[Twee
 
     primary_node = find_primary_tweet_node(data, original_url)
     if primary_node is not None:
-        collect_from_node(primary_node)
+        collect_text_from_node(primary_node)
+        collect_media_from_node(primary_node)
+        for quoted_node in find_quoted_tweet_nodes(data, primary_node):
+            collect_media_from_node(quoted_node)
     else:
         for node in _iter_candidate_tweet_nodes(data):
-            collect_from_node(node)
+            collect_text_from_node(node)
+            collect_media_from_node(node)
 
     deduped_media_items: List[TweetMediaItem] = []
     seen = set()
