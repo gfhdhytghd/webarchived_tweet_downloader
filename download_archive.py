@@ -47,16 +47,19 @@ Date: April 13, 2026 (America/New_York)
 """
 
 import argparse
+import contextlib
 import sys
 import hashlib
 import json
 import html
 import math
 import mimetypes
+import os
 import random
 import re
 import threading
 import time
+import fcntl
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -485,6 +488,22 @@ def media_index_path(asset_dir: Path) -> Path:
     return asset_dir / MEDIA_INDEX_NAME
 
 
+def media_index_lock_path(asset_dir: Path) -> Path:
+    return asset_dir / f"{MEDIA_INDEX_NAME}.lock"
+
+
+@contextlib.contextmanager
+def locked_media_index(asset_dir: Path):
+    lock_path = media_index_lock_path(asset_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def parse_snapshot_filename(filename: str) -> Optional[Tuple[str, str]]:
     match = SNAPSHOT_FILENAME_RE.match(filename)
     if not match:
@@ -639,13 +658,33 @@ def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
     return cleaned
 
 
+def _clean_media_cache_entries(asset_dir: Path, asset_dir_name: str, cache: Dict[str, str]) -> Dict[str, str]:
+    cleaned: Dict[str, str] = {}
+    expected_prefix = f"{asset_dir_name}/media/"
+    for media_url, relative_path in cache.items():
+        if not isinstance(media_url, str) or not isinstance(relative_path, str):
+            continue
+        if not relative_path.startswith(expected_prefix):
+            continue
+        if (asset_dir / "media" / Path(relative_path).name).exists():
+            cleaned[media_url] = relative_path
+    return cleaned
+
+
 def write_media_cache(asset_dir: Path, cache: Dict[str, str]) -> None:
     cache_path = media_index_path(asset_dir)
     with IMAGE_CACHE_LOCK:
-        payload = json.dumps(dict(sorted(cache.items())), ensure_ascii=False, indent=2) + "\n"
-        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(cache_path)
+        asset_dir_name = asset_dir.name
+        with locked_media_index(asset_dir):
+            disk_cache = load_media_cache(asset_dir, asset_dir_name)
+            merged_cache = _clean_media_cache_entries(asset_dir, asset_dir_name, disk_cache)
+            merged_cache.update(_clean_media_cache_entries(asset_dir, asset_dir_name, cache))
+            cache.clear()
+            cache.update(merged_cache)
+            payload = json.dumps(dict(sorted(merged_cache.items())), ensure_ascii=False, indent=2) + "\n"
+            tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            tmp_path.replace(cache_path)
 
 
 def persist_media_cache_entry(media_dir: Path, cache: Optional[Dict[str, str]]) -> None:
