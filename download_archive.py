@@ -458,13 +458,26 @@ def build_asset_source_variants(asset_url: str) -> List[str]:
             normalized_path = parsed.path[: -len(suffix)]
 
         if format_hint:
-            normalized_query = dict(query)
-            normalized_query["format"] = format_hint
-            normalized_query.setdefault("name", "orig")
-            normalized_url = urlunparse(
-                parsed._replace(path=normalized_path, query=urlencode(normalized_query))
-            )
-            add(normalized_url)
+            name_hints = [
+                query.get("name", ""),
+                "orig",
+                "4096x4096",
+                "large",
+                "medium",
+                "small",
+                "900x900",
+            ]
+            for name_hint in name_hints:
+                normalized_query = dict(query)
+                normalized_query["format"] = format_hint
+                if name_hint:
+                    normalized_query["name"] = name_hint
+                else:
+                    normalized_query.pop("name", None)
+                normalized_url = urlunparse(
+                    parsed._replace(path=normalized_path, query=urlencode(normalized_query))
+                )
+                add(normalized_url)
 
     if parsed.netloc.endswith("video.twimg.com") and parsed.query:
         add(urlunparse(parsed._replace(query="")))
