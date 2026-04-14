@@ -81,6 +81,8 @@ SESSION_LOCAL = threading.local()
 DEFAULT_MAX_WORKERS = 12
 DEFAULT_JSON_RETRY_PASSES = 3
 JSON_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_MEDIA_REPAIR_PASSES = 3
+MEDIA_REPAIR_BACKOFF_SECONDS = 2.0
 JSON_TIMEOUT = 15
 IMAGE_TIMEOUT = 10
 MEDIA_CDX_TIMEOUT = 20
@@ -98,7 +100,7 @@ MIME_EXTENSION_MAP = {
 }
 IMAGE_CACHE_LOCK = threading.RLock()
 MEDIA_CDX_LOOKUP_LOCK = threading.RLock()
-MEDIA_CDX_LOOKUP_CACHE: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+MEDIA_CDX_LOOKUP_CACHE: Dict[Tuple[str, str, str, str], List[Tuple[str, str]]] = {}
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
 MEDIA_INDEX_NAME = "media_index.json"
 ARCHIVE_FILTER_CSS = """
@@ -470,6 +472,43 @@ def build_asset_source_variants(asset_url: str) -> List[str]:
     return variants
 
 
+def build_asset_lookup_queries(asset_url: str) -> List[Tuple[str, str]]:
+    queries: List[Tuple[str, str]] = []
+    seen = set()
+
+    def add(url: str, match_type: str = "exact") -> None:
+        if not url:
+            return
+        key = (url, match_type)
+        if key in seen:
+            return
+        seen.add(key)
+        queries.append(key)
+
+    parsed = urlparse(asset_url)
+    source_variants = build_asset_source_variants(asset_url)
+    for source_url in source_variants:
+        add(source_url, "exact")
+
+    if parsed.query:
+        add(urlunparse(parsed._replace(query="")), "exact")
+
+    prefix_url = urlunparse(parsed._replace(query=""))
+    if prefix_url:
+        add(prefix_url, "prefix")
+
+    suffix = Path(parsed.path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".m3u8"}:
+        stem_prefix = urlunparse(parsed._replace(path=parsed.path[: -len(suffix)], query=""))
+        add(stem_prefix, "prefix")
+
+    if parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/"):
+        media_stem = urlunparse(parsed._replace(path=parsed.path.rsplit(".", 1)[0], query=""))
+        add(media_stem, "prefix")
+
+    return queries
+
+
 def build_archived_urls_for_source_url(source_url: str, snapshot_timestamp: str) -> List[str]:
     urls: List[str] = []
     seen = set()
@@ -480,11 +519,11 @@ def build_archived_urls_for_source_url(source_url: str, snapshot_timestamp: str)
         seen.add(url)
         urls.append(url)
 
-    add(source_url)
     if snapshot_timestamp:
         add(f"https://web.archive.org/web/{snapshot_timestamp}im_/{source_url}")
         add(f"https://web.archive.org/web/{snapshot_timestamp}if_/{source_url}")
         add(f"https://web.archive.org/web/{snapshot_timestamp}/{source_url}")
+    add(source_url)
 
     return urls
 
@@ -506,31 +545,53 @@ def build_asset_candidate_urls(asset_url: str, snapshot_timestamp: str) -> List[
     return candidates
 
 
-def query_closest_media_captures(source_url: str, snapshot_timestamp: str) -> List[Tuple[str, str]]:
-    cache_key = (source_url, snapshot_timestamp)
+def query_closest_media_captures(source_url: str, snapshot_timestamp: str, match_type: str = "exact") -> List[Tuple[str, str]]:
+    cache_key = (source_url, snapshot_timestamp, match_type, "relaxed")
     with MEDIA_CDX_LOOKUP_LOCK:
         cached = MEDIA_CDX_LOOKUP_CACHE.get(cache_key)
         if cached is not None:
             return cached
 
-    params = {
-        "url": source_url,
-        "output": "json",
-        "fl": "timestamp,original,statuscode,mimetype",
-        "filter": "statuscode:200",
-        "limit": str(MEDIA_CDX_FALLBACK_LIMIT),
-        "closest": snapshot_timestamp,
-        "collapse": "digest",
-    }
     rows: List[Tuple[str, str]] = []
-    try:
-        resp = get_with_retry(CDX_BASE_URL, params=params, timeout=MEDIA_CDX_TIMEOUT)
-        payload = resp.json()
+    seen = set()
+
+    def collect_rows(extra_params: Optional[Dict[str, str]] = None) -> bool:
+        params = {
+            "url": source_url,
+            "output": "json",
+            "fl": "timestamp,original,statuscode,mimetype",
+            "limit": str(MEDIA_CDX_FALLBACK_LIMIT),
+            "closest": snapshot_timestamp,
+            "collapse": "digest",
+        }
+        if match_type == "prefix":
+            params["matchType"] = "prefix"
+        if extra_params:
+            params.update(extra_params)
+        try:
+            resp = get_with_retry(CDX_BASE_URL, params=params, timeout=MEDIA_CDX_TIMEOUT)
+            payload = resp.json()
+        except Exception:
+            return False
+
         for row in payload[1:]:
-            if len(row) >= 2 and row[0] and row[1]:
-                rows.append((row[0], row[1]))
-    except Exception:
-        rows = []
+            if len(row) < 2 or not row[0] or not row[1]:
+                continue
+            statuscode = _coerce_string(row[2]).strip() if len(row) >= 3 else ""
+            mimetype = _coerce_string(row[3]).strip() if len(row) >= 4 else ""
+            if statuscode and statuscode not in {"200", "206", "302", "-"}:
+                continue
+            if mimetype.startswith("text/"):
+                continue
+            candidate = (row[0], row[1])
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            rows.append(candidate)
+        return bool(rows)
+
+    if not collect_rows({"filter": "statuscode:200"}):
+        collect_rows()
 
     with MEDIA_CDX_LOOKUP_LOCK:
         MEDIA_CDX_LOOKUP_CACHE[cache_key] = rows
@@ -547,8 +608,8 @@ def build_closest_capture_candidate_urls(asset_url: str, snapshot_timestamp: str
         seen.add(url)
         candidates.append(url)
 
-    for source_url in build_asset_source_variants(asset_url):
-        for capture_timestamp, original_url in query_closest_media_captures(source_url, snapshot_timestamp):
+    for source_url, match_type in build_asset_lookup_queries(asset_url):
+        for capture_timestamp, original_url in query_closest_media_captures(source_url, snapshot_timestamp, match_type=match_type):
             for candidate in build_archived_urls_for_source_url(original_url, capture_timestamp):
                 add(candidate)
 
@@ -1681,55 +1742,76 @@ def repair_missing_media_from_snapshot_records(
         write_media_cache(asset_dir, image_cache)
         return total_jobs, 0, 0, 0
 
-    repaired_count = 0
-    failed_count = 0
-
     def run_job(job: Tuple[str, str, str]) -> bool:
         kind, url, timestamp = job
         if kind == "image":
             return bool(download_image_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
         return bool(download_video_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {}
-        next_to_submit = 0
+    remaining_jobs = list(missing_jobs)
 
-        while next_to_submit < len(missing_jobs) and len(pending) < workers * 4:
-            future = executor.submit(run_job, missing_jobs[next_to_submit])
-            pending[future] = missing_jobs[next_to_submit]
-            next_to_submit += 1
+    for pass_index in range(1, DEFAULT_MEDIA_REPAIR_PASSES + 1):
+        if not remaining_jobs:
+            break
+        print(
+            f"Media repair pass {pass_index}/{DEFAULT_MEDIA_REPAIR_PASSES} "
+            f"for {len(remaining_jobs)} missing targets...",
+            flush=True,
+        )
 
-        completed_count = 0
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                job = pending.pop(future)
-                completed_count += 1
-                try:
-                    success = future.result()
-                except Exception:
-                    success = False
-                if success:
-                    repaired_count += 1
-                else:
-                    failed_count += 1
+        pass_repaired = 0
+        pass_failed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {}
+            next_to_submit = 0
 
-            while next_to_submit < len(missing_jobs) and len(pending) < workers * 4:
-                future = executor.submit(run_job, missing_jobs[next_to_submit])
-                pending[future] = missing_jobs[next_to_submit]
+            while next_to_submit < len(remaining_jobs) and len(pending) < workers * 4:
+                future = executor.submit(run_job, remaining_jobs[next_to_submit])
+                pending[future] = remaining_jobs[next_to_submit]
                 next_to_submit += 1
 
-            if completed_count % 25 == 0 or completed_count == len(missing_jobs):
-                print(
-                    f"Media repair progress: {completed_count}/{len(missing_jobs)} checked, "
-                    f"{repaired_count} repaired, {failed_count} still missing",
-                    flush=True,
-                )
+            completed_count = 0
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    job = pending.pop(future)
+                    completed_count += 1
+                    try:
+                        success = future.result()
+                    except Exception:
+                        success = False
+                    if success:
+                        pass_repaired += 1
+                    else:
+                        pass_failed += 1
 
+                while next_to_submit < len(remaining_jobs) and len(pending) < workers * 4:
+                    future = executor.submit(run_job, remaining_jobs[next_to_submit])
+                    pending[future] = remaining_jobs[next_to_submit]
+                    next_to_submit += 1
+
+                if completed_count % 25 == 0 or completed_count == len(remaining_jobs):
+                    print(
+                        f"Media repair progress: {completed_count}/{len(remaining_jobs)} checked, "
+                        f"{pass_repaired} repaired this pass, {pass_failed} still failing this pass",
+                        flush=True,
+                    )
+
+        write_media_cache(asset_dir, image_cache)
+        remaining_jobs = [
+            job for job in remaining_jobs
+            if not media_job_is_cached(media_dir, image_cache, job[1])
+        ]
+        if remaining_jobs and pass_index < DEFAULT_MEDIA_REPAIR_PASSES:
+            print(
+                f"Retrying {len(remaining_jobs)}/{missing_before} still-missing media targets after a short backoff...",
+                flush=True,
+            )
+            time.sleep(MEDIA_REPAIR_BACKOFF_SECONDS * pass_index)
+
+    missing_after = len(remaining_jobs)
+    repaired_count = missing_before - missing_after
     write_media_cache(asset_dir, image_cache)
-    missing_after = sum(
-        1 for _, url, _ in missing_jobs if not media_job_is_cached(media_dir, image_cache, url)
-    )
     return total_jobs, missing_before, repaired_count, missing_after
 
 
