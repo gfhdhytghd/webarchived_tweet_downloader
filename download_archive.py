@@ -906,16 +906,33 @@ def get_session() -> requests.Session:
     return session
 
 
+def web_archive_http_fallback_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme == "https" and parsed.netloc == "web.archive.org":
+        return urlunparse(parsed._replace(scheme="http"))
+    return ""
+
+
 def get_with_retry(url: str, *, timeout: int, params: Optional[dict] = None) -> requests.Response:
     """
     Perform a GET request with a few retries and short exponential backoff.
     """
     last_exc: Optional[Exception] = None
     for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        request_url = url
         try:
-            resp = get_session().get(url, params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp
+            while True:
+                try:
+                    resp = get_session().get(request_url, params=params, timeout=timeout)
+                    resp.raise_for_status()
+                    return resp
+                except requests.exceptions.SSLError as exc:
+                    last_exc = exc
+                    fallback_url = web_archive_http_fallback_url(request_url)
+                    if fallback_url and fallback_url != request_url:
+                        request_url = fallback_url
+                        continue
+                    raise
         except requests.HTTPError as exc:
             last_exc = exc
             status_code = exc.response.status_code if exc.response is not None else None
