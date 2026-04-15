@@ -103,6 +103,8 @@ MEDIA_CDX_LOOKUP_LOCK = threading.RLock()
 MEDIA_CDX_LOOKUP_CACHE: Dict[Tuple[str, str, str, str], List[Tuple[str, str]]] = {}
 SNAPSHOT_MANIFEST_NAME = "snapshots.json"
 MEDIA_INDEX_NAME = "media_index.json"
+MEDIA_NEGATIVE_INDEX_NAME = "media_negative_index.json"
+MEDIA_NEGATIVE_CACHE_VERSION = 1
 ARCHIVE_FILTER_CSS = """
 .archive-controls{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px;padding:12px 0;border-bottom:1px solid var(--line)}
 .archive-toggle{display:inline-flex;align-items:center;gap:10px;padding:6px 14px;border:1px solid var(--line);border-radius:9999px;background:var(--bg);cursor:pointer;user-select:none;transition:background .15s,border-color .15s}
@@ -518,6 +520,26 @@ def build_asset_lookup_queries(asset_url: str) -> List[Tuple[str, str]]:
     if parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/"):
         media_stem = urlunparse(parsed._replace(path=parsed.path.rsplit(".", 1)[0], query=""))
         add(media_stem, "prefix")
+        media_dir = urlunparse(parsed._replace(path="/media/", query=""))
+        add(media_dir, "prefix")
+
+    if parsed.netloc.endswith("video.twimg.com"):
+        path = parsed.path
+        parent_path = str(Path(path).parent)
+        if parent_path and parent_path != "." and parent_path != "/":
+            add(urlunparse(parsed._replace(path=parent_path.rstrip("/") + "/", query="")), "prefix")
+
+        root_prefixes = []
+        for marker in ("/vid/", "/pl/"):
+            if marker in path:
+                before, _ = path.split(marker, 1)
+                root_prefixes.append(before + marker)
+        for prefix_path in root_prefixes:
+            add(urlunparse(parsed._replace(path=prefix_path, query="")), "prefix")
+            if prefix_path.endswith("/vid/"):
+                add(urlunparse(parsed._replace(path=prefix_path[:-5] + "/pl/", query="")), "prefix")
+            if prefix_path.endswith("/pl/"):
+                add(urlunparse(parsed._replace(path=prefix_path[:-4] + "/vid/", query="")), "prefix")
 
     return queries
 
@@ -621,8 +643,27 @@ def build_closest_capture_candidate_urls(asset_url: str, snapshot_timestamp: str
         seen.add(url)
         candidates.append(url)
 
+    requested = urlparse(asset_url)
+    requested_suffix = Path(requested.path).suffix.lower()
+
+    def original_matches_request(original_url: str) -> bool:
+        parsed = urlparse(original_url)
+        suffix = Path(parsed.path).suffix.lower()
+        if requested.netloc.endswith("video.twimg.com"):
+            if requested_suffix == ".mp4":
+                return suffix == ".mp4"
+            if requested_suffix == ".m3u8":
+                return suffix == ".m3u8"
+        if requested.netloc.endswith("pbs.twimg.com"):
+            if requested.path.startswith("/media/"):
+                return parsed.netloc.endswith("pbs.twimg.com") and parsed.path.startswith("/media/")
+            return parsed.netloc.endswith("pbs.twimg.com")
+        return True
+
     for source_url, match_type in build_asset_lookup_queries(asset_url):
         for capture_timestamp, original_url in query_closest_media_captures(source_url, snapshot_timestamp, match_type=match_type):
+            if not original_matches_request(original_url):
+                continue
             for candidate in build_archived_urls_for_source_url(original_url, capture_timestamp):
                 add(candidate)
 
@@ -664,6 +705,10 @@ def snapshot_manifest_path(asset_dir: Path) -> Path:
 
 def media_index_path(asset_dir: Path) -> Path:
     return asset_dir / MEDIA_INDEX_NAME
+
+
+def media_negative_index_path(asset_dir: Path) -> Path:
+    return asset_dir / MEDIA_NEGATIVE_INDEX_NAME
 
 
 def media_index_lock_path(asset_dir: Path) -> Path:
@@ -836,6 +881,37 @@ def load_media_cache(asset_dir: Path, asset_dir_name: str) -> Dict[str, str]:
     return cleaned
 
 
+def load_negative_media_cache(asset_dir: Path) -> Dict[str, dict]:
+    cache_path = media_negative_index_path(asset_dir)
+    if not cache_path.exists():
+        return {}
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("version") != MEDIA_NEGATIVE_CACHE_VERSION:
+        return {}
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+
+    cleaned: Dict[str, dict] = {}
+    for media_url, meta in entries.items():
+        if not isinstance(media_url, str) or not isinstance(meta, dict):
+            continue
+        status = _coerce_string(meta.get("status")).strip()
+        reason = _coerce_string(meta.get("reason")).strip()
+        if not status and not reason:
+            continue
+        cleaned[media_url] = {
+            "status": status,
+            "reason": reason,
+        }
+    return cleaned
+
+
 def _clean_media_cache_entries(asset_dir: Path, asset_dir_name: str, cache: Dict[str, str]) -> Dict[str, str]:
     cleaned: Dict[str, str] = {}
     expected_prefix = f"{asset_dir_name}/media/"
@@ -846,6 +922,22 @@ def _clean_media_cache_entries(asset_dir: Path, asset_dir_name: str, cache: Dict
             continue
         if (asset_dir / "media" / Path(relative_path).name).exists():
             cleaned[media_url] = relative_path
+    return cleaned
+
+
+def _clean_negative_media_cache_entries(cache: Dict[str, dict]) -> Dict[str, dict]:
+    cleaned: Dict[str, dict] = {}
+    for media_url, meta in cache.items():
+        if not isinstance(media_url, str) or not isinstance(meta, dict):
+            continue
+        status = _coerce_string(meta.get("status")).strip()
+        reason = _coerce_string(meta.get("reason")).strip()
+        if not status and not reason:
+            continue
+        cleaned[media_url] = {
+            "status": status,
+            "reason": reason,
+        }
     return cleaned
 
 
@@ -865,10 +957,34 @@ def write_media_cache(asset_dir: Path, cache: Dict[str, str]) -> None:
             tmp_path.replace(cache_path)
 
 
+def write_negative_media_cache(asset_dir: Path, cache: Dict[str, dict]) -> None:
+    cache_path = media_negative_index_path(asset_dir)
+    with IMAGE_CACHE_LOCK:
+        with locked_media_index(asset_dir):
+            disk_cache = load_negative_media_cache(asset_dir)
+            merged_cache = _clean_negative_media_cache_entries(disk_cache)
+            merged_cache.update(_clean_negative_media_cache_entries(cache))
+            cache.clear()
+            cache.update(merged_cache)
+            payload = {
+                "version": MEDIA_NEGATIVE_CACHE_VERSION,
+                "entries": dict(sorted(merged_cache.items())),
+            }
+            tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(cache_path)
+
+
 def persist_media_cache_entry(media_dir: Path, cache: Optional[Dict[str, str]]) -> None:
     if cache is None:
         return
     write_media_cache(media_dir.parent, cache)
+
+
+def persist_negative_media_cache_entry(media_dir: Path, cache: Optional[Dict[str, dict]]) -> None:
+    if cache is None:
+        return
+    write_negative_media_cache(media_dir.parent, cache)
 
 
 def sort_entries(entries: List[ArchiveEntry], mode: str) -> List[ArchiveEntry]:
@@ -1550,12 +1666,13 @@ def prepare_snapshot_json_and_media(
     asset_dir_name: Optional[str] = None,
     media_dir: Optional[Path] = None,
     image_cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> str:
     json_status = ensure_snapshot_json(record, resume=resume)
     if json_status == "missing":
         return json_status
     if asset_dir_name and media_dir is not None:
-        prefetch_snapshot_media(record, asset_dir_name, media_dir, image_cache)
+        prefetch_snapshot_media(record, asset_dir_name, media_dir, image_cache, negative_cache)
     return json_status
 
 
@@ -1577,12 +1694,53 @@ def build_tweet_data_attributes(metadata: Dict[str, str], json_relative_path: st
     return " ".join(rendered)
 
 
+def is_hard_missing_error(exc: Exception) -> bool:
+    cause = exc.__cause__ if isinstance(exc, RuntimeError) and exc.__cause__ is not None else exc
+    if isinstance(cause, requests.HTTPError):
+        status_code = cause.response.status_code if cause.response is not None else None
+        return status_code in {404, 410}
+    return False
+
+
+def clear_negative_media_cache_entry(media_url: str, media_dir: Path, negative_cache: Optional[Dict[str, dict]]) -> None:
+    if negative_cache is None:
+        return
+    removed = False
+    with IMAGE_CACHE_LOCK:
+        if media_url in negative_cache:
+            negative_cache.pop(media_url, None)
+            removed = True
+    if removed:
+        persist_negative_media_cache_entry(media_dir, negative_cache)
+
+
+def is_wayback_candidate_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.netloc == "web.archive.org" and parsed.path.startswith("/web/")
+
+
+def mark_negative_media_cache_entry(
+    media_url: str,
+    media_dir: Path,
+    negative_cache: Optional[Dict[str, dict]],
+    *,
+    status: str,
+    reason: str,
+) -> None:
+    if negative_cache is None:
+        return
+    with IMAGE_CACHE_LOCK:
+        negative_cache[media_url] = {"status": status, "reason": reason}
+    persist_negative_media_cache_entry(media_dir, negative_cache)
+
+
 def download_image_asset(
     image_url: str,
     snapshot_timestamp: str,
     media_dir: Path,
     asset_dir_name: str,
     cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> str:
     """
     Download an image once and return its relative asset path.
@@ -1593,23 +1751,37 @@ def download_image_asset(
             if (media_dir / Path(cached_relative_path).name).exists():
                 return cached_relative_path
             cache.pop(image_url, None)
+        if negative_cache is not None and image_url in negative_cache:
+            return ""
 
     candidate_urls = build_image_candidate_urls(image_url, snapshot_timestamp)
     resp = None
+    saw_archived_transient_error = False
+    tried_archived_candidate = False
     for candidate_url in candidate_urls:
         try:
             resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
             break
-        except Exception:
+        except Exception as exc:
+            if is_wayback_candidate_url(candidate_url):
+                tried_archived_candidate = True
+                if not is_hard_missing_error(exc):
+                    saw_archived_transient_error = True
             resp = None
     if resp is None:
         for candidate_url in build_closest_capture_candidate_urls(image_url, snapshot_timestamp):
             try:
                 resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
                 break
-            except Exception:
+            except Exception as exc:
+                if is_wayback_candidate_url(candidate_url):
+                    tried_archived_candidate = True
+                    if not is_hard_missing_error(exc):
+                        saw_archived_transient_error = True
                 resp = None
     if resp is None:
+        if tried_archived_candidate and not saw_archived_transient_error:
+            mark_negative_media_cache_entry(image_url, media_dir, negative_cache, status="404", reason="hard-missing")
         return ""
 
     mime_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip()
@@ -1629,6 +1801,7 @@ def download_image_asset(
         if cache is not None:
             cache[image_url] = relative_path
             persist_media_cache_entry(media_dir, cache)
+        clear_negative_media_cache_entry(image_url, media_dir, negative_cache)
     return relative_path
 
 
@@ -1638,6 +1811,7 @@ def download_video_asset(
     media_dir: Path,
     asset_dir_name: str,
     cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> str:
     """
     Download one archived video variant and return its relative asset path.
@@ -1648,23 +1822,37 @@ def download_video_asset(
             if (media_dir / Path(cached_relative_path).name).exists():
                 return cached_relative_path
             cache.pop(video_url, None)
+        if negative_cache is not None and video_url in negative_cache:
+            return ""
 
     candidate_urls = build_video_candidate_urls(video_url, snapshot_timestamp)
     resp = None
+    saw_archived_transient_error = False
+    tried_archived_candidate = False
     for candidate_url in candidate_urls:
         try:
             resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
             break
-        except Exception:
+        except Exception as exc:
+            if is_wayback_candidate_url(candidate_url):
+                tried_archived_candidate = True
+                if not is_hard_missing_error(exc):
+                    saw_archived_transient_error = True
             resp = None
     if resp is None:
         for candidate_url in build_closest_capture_candidate_urls(video_url, snapshot_timestamp):
             try:
                 resp = get_with_retry(candidate_url, timeout=IMAGE_TIMEOUT)
                 break
-            except Exception:
+            except Exception as exc:
+                if is_wayback_candidate_url(candidate_url):
+                    tried_archived_candidate = True
+                    if not is_hard_missing_error(exc):
+                        saw_archived_transient_error = True
                 resp = None
     if resp is None:
+        if tried_archived_candidate and not saw_archived_transient_error:
+            mark_negative_media_cache_entry(video_url, media_dir, negative_cache, status="404", reason="hard-missing")
         return ""
 
     mime_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip()
@@ -1684,6 +1872,7 @@ def download_video_asset(
         if cache is not None:
             cache[video_url] = relative_path
             persist_media_cache_entry(media_dir, cache)
+        clear_negative_media_cache_entry(video_url, media_dir, negative_cache)
     return relative_path
 
 
@@ -1692,6 +1881,7 @@ def prefetch_snapshot_media(
     asset_dir_name: str,
     media_dir: Path,
     image_cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> None:
     data = load_snapshot_json(record.json_path)
     if data is None:
@@ -1703,11 +1893,11 @@ def prefetch_snapshot_media(
         all_media.extend(qt.media)
     for media_item in all_media:
         if media_item.kind == "image":
-            download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache)
         elif media_item.kind == "video":
-            download_video_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            download_video_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache)
             if media_item.poster_url:
-                download_image_asset(media_item.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                download_image_asset(media_item.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache)
 
 
 def collect_snapshot_media_jobs(record: SnapshotRecord) -> List[Tuple[str, str, str]]:
@@ -1753,6 +1943,13 @@ def media_job_is_cached(media_dir: Path, cache: Optional[Dict[str, str]], url: s
     return (media_dir / Path(relative_path).name).exists()
 
 
+def media_job_is_negatively_cached(negative_cache: Optional[Dict[str, dict]], url: str) -> bool:
+    if negative_cache is None:
+        return False
+    with IMAGE_CACHE_LOCK:
+        return url in negative_cache
+
+
 def repair_missing_media_from_snapshot_records(
     records: List[SnapshotRecord],
     asset_dir: Path,
@@ -1763,6 +1960,7 @@ def repair_missing_media_from_snapshot_records(
     asset_dir_name = asset_dir.name
     media_dir = asset_dir / "media"
     image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
+    negative_cache = load_negative_media_cache(asset_dir) if resume else {}
 
     unique_jobs: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
     for record in records:
@@ -1783,10 +1981,13 @@ def repair_missing_media_from_snapshot_records(
     def run_job(job: Tuple[str, str, str]) -> bool:
         kind, url, timestamp = job
         if kind == "image":
-            return bool(download_image_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
-        return bool(download_video_asset(url, timestamp, media_dir, asset_dir_name, image_cache))
+            return bool(download_image_asset(url, timestamp, media_dir, asset_dir_name, image_cache, negative_cache))
+        return bool(download_video_asset(url, timestamp, media_dir, asset_dir_name, image_cache, negative_cache))
 
-    remaining_jobs = list(missing_jobs)
+    skipped_negative = sum(1 for _, url, _ in missing_jobs if media_job_is_negatively_cached(negative_cache, url))
+    remaining_jobs = [job for job in missing_jobs if not media_job_is_negatively_cached(negative_cache, job[1])]
+    if skipped_negative:
+        print(f"Skipping {skipped_negative}/{missing_before} hard-missing targets from negative cache...", flush=True)
 
     for pass_index in range(1, DEFAULT_MEDIA_REPAIR_PASSES + 1):
         if not remaining_jobs:
@@ -1836,9 +2037,11 @@ def repair_missing_media_from_snapshot_records(
                     )
 
         write_media_cache(asset_dir, image_cache)
+        write_negative_media_cache(asset_dir, negative_cache)
         remaining_jobs = [
             job for job in remaining_jobs
             if not media_job_is_cached(media_dir, image_cache, job[1])
+            and not media_job_is_negatively_cached(negative_cache, job[1])
         ]
         if remaining_jobs and pass_index < DEFAULT_MEDIA_REPAIR_PASSES:
             print(
@@ -1847,9 +2050,13 @@ def repair_missing_media_from_snapshot_records(
             )
             time.sleep(MEDIA_REPAIR_BACKOFF_SECONDS * pass_index)
 
-    missing_after = len(remaining_jobs)
+    missing_after = sum(
+        1 for _, url, _ in missing_jobs
+        if not media_job_is_cached(media_dir, image_cache, url)
+    )
     repaired_count = missing_before - missing_after
     write_media_cache(asset_dir, image_cache)
+    write_negative_media_cache(asset_dir, negative_cache)
     return total_jobs, missing_before, repaired_count, missing_after
 
 
@@ -1859,6 +2066,7 @@ def render_snapshot_entry(
     asset_dir_name: str,
     media_dir: Path,
     image_cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> Optional[ArchiveEntry]:
     """
     Render one archived tweet snapshot from a local JSON file.
@@ -1887,7 +2095,9 @@ def render_snapshot_entry(
     media_html_parts = []
     for media_item in media_items:
         if media_item.kind == "image":
-            image_path = download_image_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            image_path = download_image_asset(
+                media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache
+            )
             if not image_path:
                 continue
             media_html_parts.append(
@@ -1895,7 +2105,9 @@ def render_snapshot_entry(
             )
             continue
         if media_item.kind == "video":
-            video_path = download_video_asset(media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+            video_path = download_video_asset(
+                media_item.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache
+            )
             if not video_path:
                 continue
             poster_attr = ""
@@ -1906,6 +2118,7 @@ def render_snapshot_entry(
                     media_dir,
                     asset_dir_name,
                     image_cache,
+                    negative_cache,
                 )
                 if poster_path:
                     poster_attr = f" poster='{html.escape(poster_path)}'"
@@ -1936,17 +2149,23 @@ def render_snapshot_entry(
         rt_media_parts = []
         for rm in rt.media:
             if rm.kind == "image":
-                rm_path = download_image_asset(rm.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                rm_path = download_image_asset(
+                    rm.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache
+                )
                 if rm_path:
                     rt_media_parts.append(
                         f"      <div class='tweet-media-item'><img src='{html.escape(rm_path)}' loading='lazy' decoding='async'/></div>\n"
                     )
             elif rm.kind == "video":
-                rm_path = download_video_asset(rm.url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                rm_path = download_video_asset(
+                    rm.url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache
+                )
                 if rm_path:
                     rm_poster = ""
                     if rm.poster_url:
-                        pp = download_image_asset(rm.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache)
+                        pp = download_image_asset(
+                            rm.poster_url, record.timestamp, media_dir, asset_dir_name, image_cache, negative_cache
+                        )
                         if pp:
                             rm_poster = f" poster='{html.escape(pp)}'"
                     rm_mime = rm.content_type or "video/mp4"
@@ -2220,6 +2439,7 @@ def download_snapshot_records(
     asset_dir_name: Optional[str] = None,
     media_dir: Optional[Path] = None,
     image_cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
 ) -> Tuple[int, int]:
     total = len(records)
     if total == 0:
@@ -2257,6 +2477,7 @@ def download_snapshot_records(
                     asset_dir_name,
                     media_dir,
                     image_cache,
+                    negative_cache,
                 )
                 pending[future] = missing_records[next_to_submit]
                 next_to_submit += 1
@@ -2285,6 +2506,7 @@ def download_snapshot_records(
                         asset_dir_name,
                         media_dir,
                         image_cache,
+                        negative_cache,
                     )
                     pending[future] = missing_records[next_to_submit]
                     next_to_submit += 1
@@ -2318,6 +2540,7 @@ def fetch_and_render_snapshot_entry(
     asset_dir_name: str,
     media_dir: Path,
     image_cache: Optional[Dict[str, str]] = None,
+    negative_cache: Optional[Dict[str, dict]] = None,
     resume: bool = True,
 ) -> Tuple[str, Optional[ArchiveEntry]]:
     json_status = prepare_snapshot_json_and_media(
@@ -2326,10 +2549,11 @@ def fetch_and_render_snapshot_entry(
         asset_dir_name=asset_dir_name,
         media_dir=media_dir,
         image_cache=image_cache,
+        negative_cache=negative_cache,
     )
     if json_status == "missing":
         return json_status, None
-    return json_status, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache)
+    return json_status, render_snapshot_entry(record, index, asset_dir_name, media_dir, image_cache, negative_cache)
 
 
 def build_archives_from_snapshot_records(
@@ -2358,12 +2582,13 @@ def build_archives_from_snapshot_records(
     media_dir = asset_dir / "media"
     asset_dir_name = asset_dir.name
     image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
+    negative_cache = load_negative_media_cache(asset_dir) if resume else {}
 
     json_dir = asset_dir / "json"
     profile = extract_user_profile(user, json_dir)
     avatar_path = ""
     if profile and profile.avatar_url:
-        avatar_path = download_image_asset(profile.avatar_url, "", media_dir, asset_dir_name, image_cache)
+        avatar_path = download_image_asset(profile.avatar_url, "", media_dir, asset_dir_name, image_cache, negative_cache)
 
     total = len(records)
     next_to_submit = 0
@@ -2384,6 +2609,7 @@ def build_archives_from_snapshot_records(
                 asset_dir_name,
                 media_dir,
                 image_cache,
+                negative_cache,
             )
             pending[future] = next_to_submit
             next_to_submit += 1
@@ -2405,6 +2631,7 @@ def build_archives_from_snapshot_records(
                     asset_dir_name,
                     media_dir,
                     image_cache,
+                    negative_cache,
                 )
                 pending[future] = next_to_submit
                 next_to_submit += 1
@@ -2424,6 +2651,7 @@ def build_archives_from_snapshot_records(
                     last_reported_rendered = rendered_count
 
     write_media_cache(asset_dir, image_cache)
+    write_negative_media_cache(asset_dir, negative_cache)
     print(f"Archive entries rendered: {rendered_count}/{total}")
     return write_all_archive_outputs(finalized_entries, user, output_path, asset_dir_name, profile=profile, avatar_path=avatar_path)
 
@@ -2436,6 +2664,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
     media_dir = asset_dir / "media"
     asset_dir_name = asset_dir.name
     image_cache = load_media_cache(asset_dir, asset_dir_name) if resume else {}
+    negative_cache = load_negative_media_cache(asset_dir) if resume else {}
 
     total = len(records)
     reused_json_count = count_existing_snapshot_json(records) if resume else 0
@@ -2467,6 +2696,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                     asset_dir_name,
                     media_dir,
                     image_cache,
+                    negative_cache,
                     resume,
                 )
                 pending[future] = next_to_submit
@@ -2489,6 +2719,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
                         asset_dir_name,
                         media_dir,
                         image_cache,
+                        negative_cache,
                         resume,
                     )
                     pending[future] = next_to_submit
@@ -2528,6 +2759,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
     print(f"JSON snapshots ready: {ready_json_count}/{total}")
     print(f"JSON snapshots downloaded this run: {downloaded_json_count}")
     write_media_cache(asset_dir, image_cache)
+    write_negative_media_cache(asset_dir, negative_cache)
 
     ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
     if missing_records:
@@ -2542,6 +2774,7 @@ def build_archives(snapshots: List[Tuple[str, str]], user: str, output_path: Pat
             asset_dir_name=asset_dir_name,
             media_dir=media_dir,
             image_cache=image_cache,
+            negative_cache=negative_cache,
         )
         ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
 
