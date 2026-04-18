@@ -1,7 +1,13 @@
 .codex
 .env
+.env.*
+!.env.schema
+env.*
+*.env
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *_archive.html
+*_archive/
+*_archive.zip
