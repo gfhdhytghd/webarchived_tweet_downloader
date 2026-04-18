@@ -3778,21 +3778,32 @@ def build_local_tweet_snapshot_index(json_dir: Optional[Path]) -> Dict[str, List
         return index
 
 
+def iter_local_snapshot_payloads_for_tweet(
+    tweet_id: str,
+    json_dir: Optional[Path],
+    snapshot_timestamp: str = "",
+) -> List[dict]:
+    if not tweet_id or json_dir is None or not json_dir.exists():
+        return []
+
+    index = build_local_tweet_snapshot_index(json_dir)
+    candidates = list(index.get(tweet_id, []))
+    candidates.sort(key=lambda item: (_timestamp_distance(item[0], snapshot_timestamp), item[0], item[1].name))
+    payloads: List[dict] = []
+    for _, json_path in candidates:
+        payload = load_snapshot_json(json_path)
+        if _payload_contains_tweet(payload, tweet_id):
+            payloads.append(payload)
+    return payloads
+
+
 def find_local_snapshot_payload_for_tweet(
     tweet_id: str,
     json_dir: Optional[Path],
     snapshot_timestamp: str = "",
 ) -> Optional[dict]:
-    if not tweet_id or json_dir is None or not json_dir.exists():
-        return None
-
-    index = build_local_tweet_snapshot_index(json_dir)
-    candidates = list(index.get(tweet_id, []))
-    candidates.sort(key=lambda item: (_timestamp_distance(item[0], snapshot_timestamp), item[0], item[1].name))
-    for _, json_path in candidates:
-        payload = load_snapshot_json(json_path)
-        if _payload_contains_tweet(payload, tweet_id):
-            return payload
+    for payload in iter_local_snapshot_payloads_for_tweet(tweet_id, json_dir, snapshot_timestamp):
+        return payload
     return None
 
 
@@ -4427,16 +4438,12 @@ def extract_tweet_content(
         if not ref_id:
             return None
 
+        cached_error = ""
         if x_api_use_json_cache:
             cached_refs, _, _, cached_error = _load_cached_x_api_reply_chain(data, ref_id, 1, ref_type)
             for cached_ref in cached_refs:
                 if cached_ref.media:
                     return cached_ref
-            if cached_error and not x_api_retry_cached_errors:
-                return None
-
-        if not allow_reply_chain_media_lookup:
-            return None
 
         def ref_info_from_payload(payload: Optional[dict], source: str) -> Optional[ReferencedTweetInfo]:
             if payload is None:
@@ -4452,6 +4459,22 @@ def extract_tweet_content(
         author_hint, _ = _resolve_referenced_tweet_author_info(data, context_node, ref_type, ref_id)
         lookup_context = _with_reply_chain_author_hint(reply_chain_lookup_context, author_hint)
         terminal_error = ""
+        if lookup_context.use_local_json:
+            for payload in iter_local_snapshot_payloads_for_tweet(
+                ref_id,
+                lookup_context.json_dir,
+                lookup_context.snapshot_timestamp,
+            ):
+                enriched_ref = ref_info_from_payload(payload, "local_json")
+                if enriched_ref is not None:
+                    return enriched_ref
+
+        if cached_error and not x_api_retry_cached_errors:
+            return None
+
+        if not allow_reply_chain_media_lookup:
+            return None
+
         if normalize_x_api_auths(x_bearer_token):
             payload, x_api_error, source = fetch_x_api_tweet_payload_with_auths(
                 x_bearer_token,

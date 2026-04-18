@@ -1394,6 +1394,107 @@ class NoteTweetExtractionTests(unittest.TestCase):
         self.assertEqual(data["_pale_fire"]["x_api_reply_chains"]["200"]["posts"][0]["payload"]["includes"]["media"][0]["url"], "https://pbs.twimg.com/media/quoted.jpg")
         x_api_fetch.assert_called_once()
 
+    def test_extract_tweet_content_enriches_quoted_media_from_local_json_before_network(self):
+        data = {
+            "data": {
+                "id": "300",
+                "author_id": "u3",
+                "conversation_id": "300",
+                "created_at": "2026-01-03T00:00:00.000Z",
+                "referenced_tweets": [{"type": "quoted", "id": "200"}],
+                "text": "quote text https://t.co/quote",
+            },
+            "includes": {
+                "users": [
+                    {"id": "u2", "username": "quoted_user", "name": "Quoted"},
+                    {"id": "u3", "username": "child_user", "name": "Child"},
+                ],
+                "tweets": [
+                    {
+                        "id": "200",
+                        "author_id": "u2",
+                        "conversation_id": "200",
+                        "created_at": "2026-01-02T00:00:00.000Z",
+                        "attachments": {"media_keys": ["3_200"]},
+                        "text": "quoted with photo https://t.co/photo",
+                    }
+                ],
+            },
+        }
+        local_payload_with_media = {
+            "data": {
+                "id": "200",
+                "author_id": "u2",
+                "conversation_id": "200",
+                "created_at": "2026-01-02T00:00:00.000Z",
+                "attachments": {"media_keys": ["3_200"]},
+                "text": "quoted with photo https://t.co/photo",
+            },
+            "includes": {
+                "users": [{"id": "u2", "username": "quoted_user", "name": "Quoted"}],
+                "media": [{"media_key": "3_200", "type": "photo", "url": "https://pbs.twimg.com/media/local.jpg"}],
+            },
+        }
+        local_payload_without_media = {
+            "data": {
+                "id": "300",
+                "author_id": "u3",
+                "conversation_id": "300",
+                "created_at": "2026-01-03T00:00:00.000Z",
+                "referenced_tweets": [{"type": "quoted", "id": "200"}],
+                "text": "quote text https://t.co/quote",
+            },
+            "includes": {
+                "users": [
+                    {"id": "u2", "username": "quoted_user", "name": "Quoted"},
+                    {"id": "u3", "username": "child_user", "name": "Child"},
+                ],
+                "tweets": [
+                    {
+                        "id": "200",
+                        "author_id": "u2",
+                        "conversation_id": "200",
+                        "created_at": "2026-01-02T00:00:00.000Z",
+                        "attachments": {"media_keys": ["3_200"]},
+                        "text": "quoted with photo https://t.co/photo",
+                    }
+                ],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            json_dir = Path(temp_dir)
+            (json_dir / "20260103000000_300.json").write_text(
+                json.dumps(local_payload_without_media),
+                encoding="utf-8",
+            )
+            (json_dir / "20260102000000_200.json").write_text(
+                json.dumps(local_payload_with_media),
+                encoding="utf-8",
+            )
+            with mock.patch.object(download_archive, "fetch_x_api_tweet_payload_with_auth") as x_api_fetch, mock.patch.object(
+                download_archive,
+                "fetch_wayback_tweet_payload",
+            ) as wayback_fetch:
+                _, _, _, ref_tweets = download_archive.extract_tweet_content(
+                    data,
+                    "https://twitter.com/child_user/status/300",
+                    x_bearer_token=download_archive.XApiAuth(
+                        oauth1=download_archive.XApiOAuth1Credentials("key", "secret", "token", "token-secret")
+                    ),
+                    reply_chain_lookup_context=download_archive.ReplyChainLookupContext(
+                        json_dir=json_dir,
+                        snapshot_timestamp="20260103000000",
+                    ),
+                    allow_reply_chain_media_lookup=False,
+                )
+
+        self.assertEqual(ref_tweets[0].kind, "quoted")
+        self.assertEqual(ref_tweets[0].media[0].url, "https://pbs.twimg.com/media/local.jpg")
+        self.assertEqual(data["_pale_fire"]["x_api_reply_chains"]["200"]["posts"][0]["source"], "local_json")
+        x_api_fetch.assert_not_called()
+        wayback_fetch.assert_not_called()
+
     def test_extract_tweet_content_does_not_network_lookup_media_when_disabled(self):
         data = {
             "data": {
