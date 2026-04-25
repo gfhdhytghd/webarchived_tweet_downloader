@@ -106,6 +106,7 @@ TWEET_CDX_FALLBACK_LIMIT = 10
 REQUEST_ATTEMPTS = 4
 DEFAULT_X_API_MIN_INTERVAL_SECONDS = 1.2
 X_API_RATE_LIMIT_RESET_PADDING_SECONDS = 2.0
+DEFAULT_EFFORT_REPLY_CHAIN_DEPTH = 8
 TWEET_URL_ID_RE = re.compile(r"/status/(\d+)")
 SNAPSHOT_FILENAME_RE = re.compile(r"^(?P<timestamp>\d{14})_(?P<tweet_id>.+)\.json$")
 MIME_EXTENSION_MAP = {
@@ -154,6 +155,61 @@ X_API_USER_FIELDS = "created_at,description,entities,id,location,name,profile_im
 X_API_MEDIA_FIELDS = "height,media_key,preview_image_url,public_metrics,type,url,variants,width"
 DEFAULT_X_API_TIMELINE_PAGES = 1
 DEFAULT_X_API_TIMELINE_PAGE_SIZE = 100
+
+
+@dataclass(frozen=True)
+class MediaFetchPolicy:
+    name: str
+    download_missing: bool
+    include_images: bool = True
+    include_videos: bool = True
+    allow_wayback_fallback: bool = True
+    allow_closest_cdx_lookup: bool = True
+
+    def should_download_kind(self, kind: str) -> bool:
+        if not self.download_missing:
+            return False
+        if kind == "image":
+            return self.include_images
+        if kind == "video":
+            return self.include_videos
+        return False
+
+
+MEDIA_FETCH_NONE = MediaFetchPolicy(
+    name="none",
+    download_missing=False,
+    include_images=False,
+    include_videos=False,
+    allow_wayback_fallback=False,
+    allow_closest_cdx_lookup=False,
+)
+MEDIA_FETCH_EASY_IMAGES = MediaFetchPolicy(
+    name="easy_image",
+    download_missing=True,
+    include_images=True,
+    include_videos=False,
+    allow_wayback_fallback=True,
+    allow_closest_cdx_lookup=False,
+)
+MEDIA_FETCH_FULL = MediaFetchPolicy(
+    name="full",
+    download_missing=True,
+    include_images=True,
+    include_videos=True,
+    allow_wayback_fallback=True,
+    allow_closest_cdx_lookup=True,
+)
+
+
+@dataclass(frozen=True)
+class EffortSettings:
+    reply_chain_depth: int
+    stream_media_policy: MediaFetchPolicy
+    final_media_policy: MediaFetchPolicy
+    run_final_media_repair: bool
+    retry_forbidden_media_in_repair: bool
+
 ARCHIVE_FILTER_CSS = """
 .archive-controls{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px;padding:12px 16px;border-bottom:1px solid var(--line)}
 .archive-toggle{display:inline-flex;align-items:center;gap:10px;padding:6px 14px;border:1px solid var(--line);border-radius:9999px;background:var(--bg);cursor:pointer;user-select:none;transition:background .15s,border-color .15s}
@@ -230,6 +286,7 @@ ARCHIVE_FILTER_CSS = """
 """
 ARCHIVE_FILTER_JS = """
 (() => {
+  let deferredData = null;
   const TWEET_FILTERS = [
     {
       key: "repost",
@@ -290,14 +347,8 @@ ARCHIVE_FILTER_JS = """
     const tabKey = `${getArchiveStorageNamespace()}-archive-tab`;
     const posts = tweets.filter((t) => t.dataset.isReply !== "true");
     const replyTweets = tweets.filter((t) => t.dataset.isReply === "true");
-    const commentIds = new Set();
-    tweets.forEach((tweet) => {
-      tweet.querySelectorAll(".tweet-comments [data-comment-id]").forEach((node) => {
-        if (node.dataset.commentId) commentIds.add(node.dataset.commentId);
-      });
-    });
-    const threadRoots = tweets.filter((t) => t.querySelector(".tweet-comments") && !commentIds.has(t.dataset.tweetId));
-    const orphanReplies = replyTweets.filter((t) => !commentIds.has(t.dataset.tweetId));
+    const threadRoots = tweets.filter((t) => t.dataset.hasComments === "true" && t.dataset.isComment !== "true");
+    const orphanReplies = replyTweets.filter((t) => t.dataset.isComment !== "true");
     const replyViewTweets = new Set([...threadRoots, ...orphanReplies]);
     if (!replyTweets.length && !threadRoots.length) return;
 
@@ -313,7 +364,6 @@ ARCHIVE_FILTER_JS = """
 
     const tabButtons = Array.from(tabBar.querySelectorAll(".archive-tab"));
     const scrollPositions = { posts: 0, replies: 0 };
-    const originalOrder = new Map(tweets.map((tweet, index) => [tweet, index]));
     let currentTab = "posts";
 
     const saved = readTabState(tabKey);
@@ -330,7 +380,6 @@ ARCHIVE_FILTER_JS = """
       currentTab = name;
       tabButtons.forEach((b) => b.classList.toggle("active", b.dataset.archiveTab === name));
       writeTabState(tabKey, name);
-      orderTweetsForTab(name);
       tweets.forEach((tweet) => {
         const isRepost = tweet.classList.contains("tweet-is-repost");
         const hiddenByFilter = isRepost && (document.querySelector("[data-filter-key=\\"repost\\"]")?.checked || false);
@@ -343,19 +392,6 @@ ARCHIVE_FILTER_JS = """
     function tabAllowsTweet(tweet, name) {
       if (name === "posts") return tweet.dataset.isReply !== "true";
       return replyViewTweets.has(tweet);
-    }
-
-    function orderTweetsForTab(name) {
-      const shell = document.querySelector(".archive-shell");
-      if (!shell) return;
-      const ordered = tweets.slice().sort((a, b) => {
-        if (name !== "replies") return originalOrder.get(a) - originalOrder.get(b);
-        const aVisible = tabAllowsTweet(a, "replies") ? 1 : 0;
-        const bVisible = tabAllowsTweet(b, "replies") ? 1 : 0;
-        if (aVisible !== bVisible) return bVisible - aVisible;
-        return originalOrder.get(a) - originalOrder.get(b);
-      });
-      ordered.forEach((tweet) => shell.appendChild(tweet));
     }
 
     function readTabState(key) {
@@ -415,7 +451,7 @@ ARCHIVE_FILTER_JS = """
 
   function setupCommentExpansion(tweets, ctrls) {
     const expandKey = `${getArchiveStorageNamespace()}-default-expand-comments`;
-    const tweetsWithComments = tweets.filter((t) => t.querySelector(".tweet-comments"));
+    const tweetsWithComments = tweets.filter((t) => t.dataset.hasComments === "true" || t.querySelector(".tweet-comments"));
     if (!tweetsWithComments.length) return;
 
     const defaultExpand = readFilterState(expandKey);
@@ -442,7 +478,7 @@ ARCHIVE_FILTER_JS = """
       if (btn) {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          const comments = tweet.querySelector(".tweet-comments");
+          const comments = ensureComments(tweet);
           if (comments) setCommentState(tweet, comments.hidden);
         });
       }
@@ -451,18 +487,14 @@ ARCHIVE_FILTER_JS = """
     applyCommentExpansionForActiveTab();
 
     function applyCommentExpansionForActiveTab() {
-      const activeTab = window._archiveActiveTab ? window._archiveActiveTab() : "posts";
       tweetsWithComments.forEach((tweet) => {
-        const forceExpanded = activeTab === "replies"
-          && window._archiveTabAllowsTweet
-          && window._archiveTabAllowsTweet(tweet, "replies");
-        setCommentState(tweet, forceExpanded || globalCheckbox.checked);
+        setCommentState(tweet, globalCheckbox.checked);
       });
     }
   }
 
   function setCommentState(tweet, expanded) {
-    const comments = tweet.querySelector(".tweet-comments");
+    const comments = expanded ? ensureComments(tweet) : tweet.querySelector(".tweet-comments");
     const btn = tweet.querySelector(".tweet-expand-btn");
     if (comments) comments.hidden = !expanded;
     if (btn) {
@@ -494,13 +526,22 @@ ARCHIVE_FILTER_JS = """
       writeFilterState(expandKey, globalCheckbox.checked);
       tweetsWithChain.forEach((tweet) => {
         const chain = tweet.querySelector(".tweet-reply-chain");
-        if (chain) chain.open = globalCheckbox.checked;
+        if (chain) {
+          if (globalCheckbox.checked) hydrateReplyChain(tweet, chain);
+          chain.open = globalCheckbox.checked;
+        }
       });
     });
 
     tweetsWithChain.forEach((tweet) => {
       const chain = tweet.querySelector(".tweet-reply-chain");
-      if (chain) chain.open = defaultExpand;
+      if (chain) {
+        chain.addEventListener("toggle", () => {
+          if (chain.open) hydrateReplyChain(tweet, chain);
+        });
+        if (defaultExpand) hydrateReplyChain(tweet, chain);
+        chain.open = defaultExpand;
+      }
     });
   }
 
@@ -511,11 +552,11 @@ ARCHIVE_FILTER_JS = """
     const closeBtn = panel.querySelector(".detail-panel-close");
     const panelBody = panel.querySelector(".detail-panel-body");
 
-    document.querySelectorAll(".tweet").forEach((tweet) => {
-      tweet.addEventListener("click", (e) => {
-        if (e.target.closest("a, button, video, input, .lightbox")) return;
-        openPanel(tweet);
-      });
+    document.querySelector(".archive-shell")?.addEventListener("click", (e) => {
+      const tweet = e.target.closest(".tweet");
+      if (!tweet) return;
+      if (e.target.closest("a, button, video, input, .lightbox")) return;
+      openPanel(tweet);
     });
 
     function openPanel(tweet) {
@@ -523,10 +564,14 @@ ARCHIVE_FILTER_JS = """
 
       // Referenced / replied-to content (shown above post)
       const replyChain = tweet.querySelector(".tweet-reply-chain");
-      if (replyChain) {
+      const record = getDeferredRecord(tweet);
+      if (replyChain && record.r) {
         const ctx = document.createElement("div");
         ctx.className = "detail-context";
         const chainClone = replyChain.cloneNode(true);
+        if (!chainClone.querySelector(".tweet-ref")) {
+          chainClone.insertAdjacentHTML("beforeend", record.r);
+        }
         chainClone.open = true;
         ctx.appendChild(chainClone);
         panelBody.appendChild(ctx);
@@ -546,13 +591,14 @@ ARCHIVE_FILTER_JS = """
 
       // Comments (shown below post)
       const comments = tweet.querySelector(".tweet-comments");
-      const commentCount = comments ? Number(comments.dataset.commentTotal || comments.children.length || 0) : 0;
-      if (comments && commentCount) {
+      const commentHtml = comments ? comments.innerHTML : extractDeferredCommentsInnerHtml(record.c || "");
+      const commentCount = Number(record.cc || (comments ? comments.dataset.commentTotal || comments.children.length || 0 : 0));
+      if (commentHtml && commentCount) {
         const section = document.createElement("div");
         section.className = "detail-comments";
         section.innerHTML =
           "<div class='detail-comments-header'>\u8bc4\u8bba (" + commentCount + ")</div>" +
-          comments.innerHTML +
+          commentHtml +
           "<p class='detail-note'>\u4ec5\u5305\u542b\u672c\u5730\u5b58\u6863\u53ca\u5df2\u7f13\u5b58\u56de\u590d\u94fe\u4e2d\u53ef\u89c1\u7684\u8bc4\u8bba\uff0c\u5e76\u6309\u7236\u5b50\u56de\u590d\u5173\u7cfb\u5d4c\u5957\u663e\u793a</p>";
         panelBody.appendChild(section);
       }
@@ -610,6 +656,57 @@ ARCHIVE_FILTER_JS = """
     return (scratch.textContent || "").trim();
   }
 
+  function readDeferredData() {
+    if (deferredData) return deferredData;
+    const node = document.getElementById("archive-deferred-data");
+    if (!node) {
+      deferredData = {};
+      return deferredData;
+    }
+    try {
+      deferredData = JSON.parse(node.textContent || "{}");
+    } catch {
+      deferredData = {};
+    }
+    return deferredData;
+  }
+
+  function getDeferredRecord(tweet) {
+    const id = tweet?.dataset?.tweetId;
+    const data = readDeferredData();
+    return id && data[id] ? data[id] : {};
+  }
+
+  function ensureComments(tweet) {
+    let comments = tweet.querySelector(".tweet-comments");
+    if (comments) return comments;
+    const record = getDeferredRecord(tweet);
+    if (!record.c) return null;
+    const footer = tweet.querySelector(".tweet-footer");
+    if (footer) {
+      footer.insertAdjacentHTML("beforebegin", record.c);
+      comments = footer.previousElementSibling;
+    } else {
+      tweet.insertAdjacentHTML("beforeend", record.c);
+      comments = tweet.lastElementChild;
+    }
+    return comments?.matches(".tweet-comments") ? comments : tweet.querySelector(".tweet-comments");
+  }
+
+  function hydrateReplyChain(tweet, chain) {
+    if (!chain || chain.querySelector(".tweet-ref")) return;
+    const record = getDeferredRecord(tweet);
+    if (record.r) chain.insertAdjacentHTML("beforeend", record.r);
+  }
+
+  function extractDeferredCommentsInnerHtml(html) {
+    if (!html) return "";
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const comments = template.content.querySelector(".tweet-comments");
+    return comments ? comments.innerHTML : "";
+  }
+
   function getArchiveStorageNamespace() {
     const file = (window.location.pathname.split("/").pop() || "archive.html").replace(/\\.html$/i, "");
     return file.replace(/_(time_desc|media_first_time_desc|text_length_desc|text_entropy_desc)$/i, "");
@@ -652,7 +749,7 @@ body{margin:0;color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Seg
 .archive-badge{display:none}
 .archive-title{font-size:20px;font-weight:700;line-height:1.3;letter-spacing:normal}
 .archive-subtitle{margin:2px 0 0;color:var(--muted);font-size:13px;line-height:1.4}
-.tweet{padding:12px 16px;border-bottom:1px solid var(--line);transition:background .15s;cursor:pointer}
+.tweet{padding:12px 16px;border-bottom:1px solid var(--line);transition:background .15s;cursor:pointer;content-visibility:auto;contain-intrinsic-size:auto 240px}
 .tweet:hover{background:var(--hover)}
 h3{font-size:13px;font-weight:400;color:var(--muted)}
 p{margin:4px 0 0;font-size:15px;color:var(--ink);line-height:1.5;overflow-wrap:anywhere}
@@ -714,17 +811,6 @@ ARCHIVE_JS = """
     document.body.classList.add("lightbox-open");
   }
 
-  function prepareImage(image) {
-    image.loading = "lazy";
-    image.decoding = "async";
-    image.tabIndex = 0;
-    image.setAttribute("role", "button");
-  }
-
-  function prepareImages(root) {
-    root.querySelectorAll(".tweet-media-item img").forEach(prepareImage);
-  }
-
   lightbox.addEventListener("click", closeLightbox);
 
   document.addEventListener("click", (event) => {
@@ -751,19 +837,6 @@ ARCHIVE_JS = """
     event.stopPropagation();
     openLightbox(image);
   }, true);
-
-  prepareImages(document);
-
-  const observer = new MutationObserver((mutations) => {
-    mutations.forEach((mutation) => {
-      mutation.addedNodes.forEach((node) => {
-        if (!(node instanceof Element)) return;
-        if (node.matches(".tweet-media-item img")) prepareImage(node);
-        prepareImages(node);
-      });
-    });
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
 })();
 """
 INDEX_PAGE_CSS = """
@@ -805,6 +878,12 @@ class ArchiveEntry:
     comments_placeholder: str = ""
     expand_placeholder: str = ""
     comment_parent_entries: Tuple["ArchiveEntry", ...] = ()
+    deferred_comments_html: str = ""
+    deferred_comment_count: int = 0
+    deferred_comment_latest_ts: int = 0
+    deferred_comment_ids: Tuple[str, ...] = ()
+    deferred_reply_chain_html: str = ""
+    deferred_reply_chain_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -4783,6 +4862,7 @@ def prepare_snapshot_json_and_media(
     negative_cache: Optional[Dict[str, dict]] = None,
     failure_statuses: Optional[Dict[SnapshotRecord, str]] = None,
     retry_forbidden_media: bool = False,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> str:
     json_status = ensure_snapshot_json(record, resume=resume, failure_statuses=failure_statuses)
     if json_status == "missing":
@@ -4795,6 +4875,7 @@ def prepare_snapshot_json_and_media(
             image_cache,
             negative_cache,
             retry_forbidden_media=retry_forbidden_media,
+            media_fetch_policy=media_fetch_policy,
         )
     return json_status
 
@@ -4875,6 +4956,7 @@ def download_image_asset(
     failure_statuses: Optional[Dict[str, str]] = None,
     retry_forbidden_media: bool = False,
     allow_wayback_fallback: bool = True,
+    allow_closest_cdx_lookup: bool = True,
 ) -> str:
     """
     Download an image once and return its relative asset path.
@@ -4925,7 +5007,7 @@ def download_image_asset(
                 saw_forbidden_error = True
             resp = None
     closest_capture_candidates = []
-    if resp is None and allow_wayback_fallback:
+    if resp is None and allow_wayback_fallback and allow_closest_cdx_lookup:
         closest_capture_candidates = build_closest_capture_candidate_urls(image_url, snapshot_timestamp)
         for candidate_url in closest_capture_candidates:
             try:
@@ -4954,7 +5036,12 @@ def download_image_asset(
                 reason=negative_media_reason_for_status(latest_http_status),
             )
             return ""
-        if not latest_http_status and tried_archived_candidate and (not closest_capture_candidates or media_cdx_has_any_capture(image_url) is False):
+        if (
+            allow_closest_cdx_lookup
+            and not latest_http_status
+            and tried_archived_candidate
+            and (not closest_capture_candidates or media_cdx_has_any_capture(image_url) is False)
+        ):
             latest_http_status = "404"
             mark_negative_media_cache_entry(image_url, media_dir, negative_cache, status=latest_http_status, reason="no-capture")
         if failure_statuses is not None:
@@ -5002,6 +5089,7 @@ def download_video_asset(
     failure_statuses: Optional[Dict[str, str]] = None,
     retry_forbidden_media: bool = False,
     allow_wayback_fallback: bool = True,
+    allow_closest_cdx_lookup: bool = True,
 ) -> str:
     """
     Download one archived video variant and return its relative asset path.
@@ -5052,7 +5140,7 @@ def download_video_asset(
                 saw_forbidden_error = True
             resp = None
     closest_capture_candidates = []
-    if resp is None and allow_wayback_fallback:
+    if resp is None and allow_wayback_fallback and allow_closest_cdx_lookup:
         closest_capture_candidates = build_closest_capture_candidate_urls(video_url, snapshot_timestamp)
         for candidate_url in closest_capture_candidates:
             try:
@@ -5081,7 +5169,12 @@ def download_video_asset(
                 reason=negative_media_reason_for_status(latest_http_status),
             )
             return ""
-        if not latest_http_status and tried_archived_candidate and (not closest_capture_candidates or media_cdx_has_any_capture(video_url) is False):
+        if (
+            allow_closest_cdx_lookup
+            and not latest_http_status
+            and tried_archived_candidate
+            and (not closest_capture_candidates or media_cdx_has_any_capture(video_url) is False)
+        ):
             latest_http_status = "404"
             mark_negative_media_cache_entry(video_url, media_dir, negative_cache, status=latest_http_status, reason="no-capture")
         if failure_statuses is not None:
@@ -5125,12 +5218,23 @@ def prefetch_snapshot_media(
     image_cache: Optional[Dict[str, str]] = None,
     negative_cache: Optional[Dict[str, dict]] = None,
     retry_forbidden_media: bool = False,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> None:
     data = load_snapshot_json(record.json_path)
     if data is None:
         return
 
-    _, media_items, _, ref_tweets = extract_tweet_content(data, record.original_url)
+    policy = media_fetch_policy or MEDIA_FETCH_FULL
+    _, media_items, _, ref_tweets = extract_tweet_content(
+        data,
+        record.original_url,
+        reply_chain_lookup_context=ReplyChainLookupContext(
+            json_dir=record.json_path.parent,
+            snapshot_timestamp=record.timestamp,
+            use_wayback=policy.download_missing and policy.allow_wayback_fallback,
+        ),
+        allow_reply_chain_media_lookup=policy.download_missing,
+    )
     all_media = list(media_items)
     for qt in ref_tweets:
         all_media.extend(qt.media)
@@ -5143,7 +5247,10 @@ def prefetch_snapshot_media(
                 asset_dir_name,
                 image_cache,
                 negative_cache,
+                download_missing=policy.should_download_kind("image"),
                 retry_forbidden_media=retry_forbidden_media,
+                allow_wayback_fallback=policy.allow_wayback_fallback,
+                allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
             )
         elif media_item.kind == "video":
             download_video_asset(
@@ -5153,7 +5260,10 @@ def prefetch_snapshot_media(
                 asset_dir_name,
                 image_cache,
                 negative_cache,
+                download_missing=policy.should_download_kind("video"),
                 retry_forbidden_media=retry_forbidden_media,
+                allow_wayback_fallback=policy.allow_wayback_fallback,
+                allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
             )
             if media_item.poster_url:
                 download_image_asset(
@@ -5163,7 +5273,10 @@ def prefetch_snapshot_media(
                     asset_dir_name,
                     image_cache,
                     negative_cache,
+                    download_missing=policy.should_download_kind("video"),
                     retry_forbidden_media=retry_forbidden_media,
+                    allow_wayback_fallback=policy.allow_wayback_fallback,
+                    allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
                 )
 
 
@@ -5661,7 +5774,9 @@ def repair_missing_media_from_snapshot_records(
     reverse_resume: bool = False,
     verbose: bool = False,
     retry_forbidden_media: bool = False,
+    retry_forbidden_each_pass: bool = False,
     allow_wayback_media_fallback: bool = True,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> Tuple[int, int, int, int]:
     ensure_asset_directories(asset_dir)
     asset_dir_name = asset_dir.name
@@ -5672,8 +5787,10 @@ def repair_missing_media_from_snapshot_records(
         retry_count = drop_forbidden_negative_media_cache_entries(asset_dir, negative_cache)
         if retry_count:
             print(f"Retrying {retry_count} cached HTTP 403 media targets...", flush=True)
-        retry_forbidden_media = False
+        if not retry_forbidden_each_pass:
+            retry_forbidden_media = False
     media_failure_statuses: Dict[str, str] = {}
+    policy = media_fetch_policy or MEDIA_FETCH_FULL
 
     unique_jobs: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
     record_jobs: Dict[SnapshotRecord, List[Tuple[str, str, str]]] = {}
@@ -5843,7 +5960,9 @@ def repair_missing_media_from_snapshot_records(
                     negative_cache,
                     failure_statuses=media_failure_statuses,
                     retry_forbidden_media=retry_forbidden_media,
-                    allow_wayback_fallback=allow_wayback_media_fallback,
+                    allow_wayback_fallback=allow_wayback_media_fallback and policy.allow_wayback_fallback,
+                    allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
+                    download_missing=policy.should_download_kind("image"),
                 )
             )
         return bool(
@@ -5856,7 +5975,9 @@ def repair_missing_media_from_snapshot_records(
                 negative_cache,
                 failure_statuses=media_failure_statuses,
                 retry_forbidden_media=retry_forbidden_media,
-                allow_wayback_fallback=allow_wayback_media_fallback,
+                allow_wayback_fallback=allow_wayback_media_fallback and policy.allow_wayback_fallback,
+                allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
+                download_missing=policy.should_download_kind("video"),
             )
         )
 
@@ -6116,6 +6237,7 @@ def render_snapshot_entry(
     x_api_reply_chain_use_wayback: bool = True,
     retry_forbidden_media: bool = False,
     x_api_access_index: Optional[dict] = None,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> Optional[ArchiveEntry]:
     """
     Render one archived tweet snapshot from a local JSON file.
@@ -6131,6 +6253,9 @@ def render_snapshot_entry(
     if data is None:
         return None
 
+    policy = media_fetch_policy or (
+        MEDIA_FETCH_FULL if download_missing_media else MEDIA_FETCH_NONE
+    )
     x_api_enrichment_changed: List[bool] = []
     text, media_items, metadata, ref_tweets = extract_tweet_content(
         data,
@@ -6143,7 +6268,7 @@ def render_snapshot_entry(
             snapshot_timestamp=record.timestamp,
             use_wayback=x_api_reply_chain_depth > 0 and x_api_reply_chain_use_wayback,
         ),
-        allow_reply_chain_media_lookup=download_missing_media,
+        allow_reply_chain_media_lookup=policy.download_missing,
         x_api_access_index=x_api_access_index,
     )
     if x_api_enrichment_changed:
@@ -6174,8 +6299,10 @@ def render_snapshot_entry(
                 asset_dir_name,
                 image_cache,
                 negative_cache,
-                download_missing=download_missing_media,
+                download_missing=policy.should_download_kind("image"),
                 retry_forbidden_media=retry_forbidden_media,
+                allow_wayback_fallback=policy.allow_wayback_fallback,
+                allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
             )
             if not image_path:
                 missing_media_kinds.append("image")
@@ -6195,8 +6322,10 @@ def render_snapshot_entry(
                 asset_dir_name,
                 image_cache,
                 negative_cache,
-                download_missing=download_missing_media,
+                download_missing=policy.should_download_kind("video"),
                 retry_forbidden_media=retry_forbidden_media,
+                allow_wayback_fallback=policy.allow_wayback_fallback,
+                allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
             )
             if not video_path:
                 missing_media_kinds.append("video")
@@ -6210,15 +6339,17 @@ def render_snapshot_entry(
                     asset_dir_name,
                     image_cache,
                     negative_cache,
-                    download_missing=download_missing_media,
+                    download_missing=policy.should_download_kind("video"),
                     retry_forbidden_media=retry_forbidden_media,
+                    allow_wayback_fallback=policy.allow_wayback_fallback,
+                    allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
                 )
                 if poster_path:
                     poster_attr = f" poster='{html.escape(poster_path)}'"
             mime_type = media_item.content_type or "video/mp4"
             media_html_parts.append(
                 "  <div class='tweet-media-item'>"
-                f"<video class='tweet-video' controls preload='metadata' playsinline{poster_attr}>"
+                f"<video class='tweet-video' controls preload='none' playsinline{poster_attr}>"
                 f"<source src='{html.escape(video_path)}' type='{html.escape(mime_type)}'/>"
                 "Your browser does not support the video tag."
                 "</video></div>\n"
@@ -6281,8 +6412,10 @@ def render_snapshot_entry(
                     asset_dir_name,
                     image_cache,
                     negative_cache,
-                    download_missing=download_missing_media,
+                    download_missing=policy.should_download_kind("image"),
                     retry_forbidden_media=retry_forbidden_media,
+                    allow_wayback_fallback=policy.allow_wayback_fallback,
+                    allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
                 )
                 if rm_path:
                     rt_media_parts.append(
@@ -6301,8 +6434,10 @@ def render_snapshot_entry(
                     asset_dir_name,
                     image_cache,
                     negative_cache,
-                    download_missing=download_missing_media,
+                    download_missing=policy.should_download_kind("video"),
                     retry_forbidden_media=retry_forbidden_media,
+                    allow_wayback_fallback=policy.allow_wayback_fallback,
+                    allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
                 )
                 if rm_path:
                     rm_poster = ""
@@ -6314,14 +6449,16 @@ def render_snapshot_entry(
                             asset_dir_name,
                             image_cache,
                             negative_cache,
-                            download_missing=download_missing_media,
+                            download_missing=policy.should_download_kind("video"),
                             retry_forbidden_media=retry_forbidden_media,
+                            allow_wayback_fallback=policy.allow_wayback_fallback,
+                            allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
                         )
                         if pp:
                             rm_poster = f" poster='{html.escape(pp)}'"
                     rm_mime = rm.content_type or "video/mp4"
                     rt_media_parts.append(
-                        f"      <div class='tweet-media-item'><video class='tweet-video' controls preload='metadata' playsinline{rm_poster}>"
+                        f"      <div class='tweet-media-item'><video class='tweet-video' controls preload='none' playsinline{rm_poster}>"
                         f"<source src='{html.escape(rm_path)}' type='{html.escape(rm_mime)}'/></video></div>\n"
                     )
                 else:
@@ -6383,8 +6520,18 @@ def render_snapshot_entry(
                     )
                 )
 
+    deferred_reply_chain_html = ""
+    deferred_reply_chain_count = 0
     reply_chain_context_html = ""
-    if reply_chain_html:
+    if reply_chain_html and tweet_id:
+        deferred_reply_chain_html = reply_chain_html
+        deferred_reply_chain_count = reply_chain_count
+        reply_chain_context_html = (
+            f"  <details class='tweet-reply-chain' data-reply-chain-id='{html.escape(tweet_id)}'>\n"
+            f"    <summary>\u4e0a\u7ea7\u56de\u590d\u94fe ({reply_chain_count})</summary>\n"
+            f"  </details>\n"
+        )
+    elif reply_chain_html:
         reply_chain_context_html = (
             f"  <details class='tweet-reply-chain'>\n"
             f"    <summary>\u4e0a\u7ea7\u56de\u590d\u94fe ({reply_chain_count})</summary>\n"
@@ -6415,6 +6562,8 @@ def render_snapshot_entry(
         comments_placeholder=comments_placeholder,
         expand_placeholder=expand_placeholder,
         comment_parent_entries=tuple(comment_parent_entries),
+        deferred_reply_chain_html=deferred_reply_chain_html,
+        deferred_reply_chain_count=deferred_reply_chain_count,
     )
 
 
@@ -6513,7 +6662,57 @@ def render_document_start(user: str, total: int, asset_dir_name: str, title_suff
     )
 
 
-def render_document_end(asset_dir_name: str) -> str:
+def inline_json_script_payload(data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return re.sub(r"</", r"<\\/", payload, flags=re.IGNORECASE)
+
+
+def extract_comment_ids_from_html(comments_html: str) -> Tuple[str, ...]:
+    if not comments_html:
+        return ()
+    return tuple(dict.fromkeys(re.findall(r"data-comment-id=['\"]([^'\"]+)['\"]", comments_html)))
+
+
+def add_tweet_data_attribute(block: str, name: str, value: str) -> str:
+    if not block.startswith("<div class='tweet'"):
+        return block
+    attr = f" {name}='{html.escape(value)}'"
+    end = block.find(">")
+    if end == -1:
+        return block
+    return f"{block[:end]}{attr}{block[end:]}"
+
+
+def build_deferred_archive_data(entries: List[ArchiveEntry]) -> dict:
+    data = {}
+    for entry in entries:
+        if not entry.tweet_id:
+            continue
+        record = {}
+        if entry.deferred_comments_html:
+            record["c"] = entry.deferred_comments_html
+            record["cc"] = entry.deferred_comment_count
+            record["cl"] = entry.deferred_comment_latest_ts
+        if entry.deferred_reply_chain_html:
+            record["r"] = entry.deferred_reply_chain_html
+            record["rc"] = entry.deferred_reply_chain_count
+        if record:
+            data[entry.tweet_id] = record
+    return data
+
+
+def render_deferred_archive_data(entries: List[ArchiveEntry]) -> str:
+    data = build_deferred_archive_data(entries)
+    if not data:
+        return ""
+    return (
+        "<script type='application/json' id='archive-deferred-data'>"
+        f"{inline_json_script_payload(data)}"
+        "</script>\n"
+    )
+
+
+def render_document_end(asset_dir_name: str, deferred_data_html: str = "") -> str:
     panel_html = (
         "<div class='detail-panel'>\n"
         "  <div class='detail-panel-header'>\n"
@@ -6529,6 +6728,7 @@ def render_document_end(asset_dir_name: str) -> str:
         "</div>\n"
         f"{panel_html}"
         "</div>\n"
+        f"{deferred_data_html}"
         f"<script src='{html.escape(asset_dir_name)}/archive.js'></script>\n"
         "</body>\n</html>"
     )
@@ -6694,16 +6894,47 @@ def attach_local_comment_sections(entries: List[ArchiveEntry]) -> List[ArchiveEn
             deduped.append(child)
         children_by_parent[parent_id] = deduped
 
+    rendered_comment_ids = {
+        child.tweet_id
+        for children in children_by_parent.values()
+        for child in children
+        if child.tweet_id
+    }
     updated_entries: List[ArchiveEntry] = []
     for entry in entries:
         if not entry.comments_placeholder:
-            updated_entries.append(entry)
+            new_block = entry.block
+            if entry.tweet_id in rendered_comment_ids:
+                new_block = add_tweet_data_attribute(new_block, "data-is-comment", "true")
+            updated_entries.append(replace(entry, block=new_block) if new_block != entry.block else entry)
             continue
         comments_div, expand_btn = build_comment_section_html(entry.tweet_id, children_by_parent)
-        new_block = entry.block.replace(entry.comments_placeholder, comments_div)
+        new_block = entry.block.replace(entry.comments_placeholder, "")
         if entry.expand_placeholder:
             new_block = new_block.replace(entry.expand_placeholder, expand_btn)
-        updated_entries.append(replace(entry, block=new_block))
+        comment_count = 0
+        comment_latest_ts = 0
+        if comments_div:
+            count_match = re.search(r"data-comment-total='(\d+)'", comments_div)
+            latest_match = re.search(r"data-comment-latest-ts='(\d+)'", comments_div)
+            if count_match:
+                comment_count = int(count_match.group(1))
+            if latest_match:
+                comment_latest_ts = int(latest_match.group(1))
+        if comment_count:
+            new_block = add_tweet_data_attribute(new_block, "data-has-comments", "true")
+        if entry.tweet_id in rendered_comment_ids:
+            new_block = add_tweet_data_attribute(new_block, "data-is-comment", "true")
+        updated_entries.append(
+            replace(
+                entry,
+                block=new_block,
+                deferred_comments_html=comments_div,
+                deferred_comment_count=comment_count,
+                deferred_comment_latest_ts=comment_latest_ts,
+                deferred_comment_ids=extract_comment_ids_from_html(comments_div),
+            )
+        )
     return updated_entries
 
 
@@ -6720,7 +6951,7 @@ def write_archive_html(
         f.write(render_document_start(user, len(entries), asset_dir_name, title_suffix, profile=profile, avatar_path=avatar_path))
         for entry in entries:
             f.write(entry.block)
-        f.write(render_document_end(asset_dir_name))
+        f.write(render_document_end(asset_dir_name, render_deferred_archive_data(entries)))
 
 
 def get_archive_output_jobs(output_path: Path) -> List[Tuple[str, str, Path]]:
@@ -6786,6 +7017,7 @@ def download_snapshot_records(
     negative_cache: Optional[Dict[str, dict]] = None,
     reverse_resume: bool = False,
     verbose: bool = False,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> Tuple[int, int]:
     total = len(records)
     if total == 0:
@@ -6831,6 +7063,7 @@ def download_snapshot_records(
                     image_cache,
                     negative_cache,
                     json_failure_statuses,
+                    media_fetch_policy=media_fetch_policy,
                 )
                 pending[future] = missing_records[next_to_submit]
                 next_to_submit += 1
@@ -6866,6 +7099,7 @@ def download_snapshot_records(
                         image_cache,
                         negative_cache,
                         json_failure_statuses,
+                        media_fetch_policy=media_fetch_policy,
                     )
                     pending[future] = missing_records[next_to_submit]
                     next_to_submit += 1
@@ -6909,6 +7143,7 @@ def fetch_and_render_snapshot_entry(
     x_api_reply_chain_use_wayback: bool = True,
     retry_forbidden_media: bool = False,
     x_api_access_index: Optional[dict] = None,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> Tuple[str, Optional[ArchiveEntry], str]:
     failure_statuses: Dict[SnapshotRecord, str] = {}
     json_status = prepare_snapshot_json_and_media(
@@ -6920,6 +7155,7 @@ def fetch_and_render_snapshot_entry(
         negative_cache=negative_cache,
         failure_statuses=failure_statuses,
         retry_forbidden_media=retry_forbidden_media,
+        media_fetch_policy=media_fetch_policy,
     )
     if json_status == "missing":
         return json_status, None, failure_statuses.get(record, "")
@@ -6937,6 +7173,7 @@ def fetch_and_render_snapshot_entry(
             x_api_reply_chain_use_wayback=x_api_reply_chain_use_wayback,
             retry_forbidden_media=retry_forbidden_media,
             x_api_access_index=x_api_access_index,
+            media_fetch_policy=media_fetch_policy,
         ),
         "",
     )
@@ -6957,6 +7194,7 @@ def build_archives_from_snapshot_records(
     verbose: bool = False,
     retry_forbidden_media: bool = False,
     x_api_access_index: Optional[dict] = None,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
 ) -> List[Path]:
     """
     Render local snapshot JSON files into the base archive plus four sorted variants.
@@ -6982,6 +7220,9 @@ def build_archives_from_snapshot_records(
         if retry_count:
             print(f"Retrying {retry_count} cached HTTP 403 media targets...", flush=True)
         retry_forbidden_media = False
+    policy = media_fetch_policy or (
+        MEDIA_FETCH_FULL if download_missing_media else MEDIA_FETCH_NONE
+    )
 
     json_dir = asset_dir / "json"
     profile = extract_user_profile(user, json_dir)
@@ -6994,8 +7235,10 @@ def build_archives_from_snapshot_records(
             asset_dir_name,
             image_cache,
             negative_cache,
-            download_missing=download_missing_media,
+            download_missing=policy.should_download_kind("image"),
             retry_forbidden_media=retry_forbidden_media,
+            allow_wayback_fallback=policy.allow_wayback_fallback,
+            allow_closest_cdx_lookup=policy.allow_closest_cdx_lookup,
         )
 
     total = len(records)
@@ -7029,6 +7272,7 @@ def build_archives_from_snapshot_records(
                 x_api_reply_chain_use_wayback,
                 retry_forbidden_media,
                 x_api_access_index,
+                policy,
             )
             pending[future] = record_index
             next_to_submit += 1
@@ -7064,6 +7308,7 @@ def build_archives_from_snapshot_records(
                     x_api_reply_chain_use_wayback,
                     retry_forbidden_media,
                     x_api_access_index,
+                    policy,
                 )
                 pending[future] = record_index
                 next_to_submit += 1
@@ -7101,6 +7346,10 @@ def build_archives(
     verbose: bool = False,
     retry_forbidden_media: bool = False,
     x_api_access_index: Optional[dict] = None,
+    media_fetch_policy: Optional[MediaFetchPolicy] = None,
+    final_media_fetch_policy: Optional[MediaFetchPolicy] = None,
+    final_media_repair: bool = False,
+    final_media_repair_retry_forbidden: bool = False,
 ) -> List[Path]:
     ensure_asset_directories(asset_dir)
     records = build_snapshot_records(snapshots, asset_dir / "json")
@@ -7115,6 +7364,8 @@ def build_archives(
         if retry_count:
             print(f"Retrying {retry_count} cached HTTP 403 media targets...", flush=True)
         retry_forbidden_media = False
+    stream_policy = media_fetch_policy or MEDIA_FETCH_FULL
+    final_policy = final_media_fetch_policy or stream_policy
 
     total = len(records)
     reused_json_count = count_existing_snapshot_json(records) if resume else 0
@@ -7159,6 +7410,7 @@ def build_archives(
                     x_api_reply_chain_use_wayback,
                     retry_forbidden_media,
                     x_api_access_index,
+                    stream_policy,
                 )
                 pending[future] = record_index
                 next_to_submit += 1
@@ -7191,6 +7443,7 @@ def build_archives(
                         x_api_reply_chain_use_wayback,
                         retry_forbidden_media,
                         x_api_access_index,
+                        stream_policy,
                     )
                     pending[future] = record_index
                     next_to_submit += 1
@@ -7247,8 +7500,29 @@ def build_archives(
             negative_cache=negative_cache,
             reverse_resume=reverse_resume,
             verbose=verbose,
+            media_fetch_policy=stream_policy,
         )
         ready_records, missing_records = split_ready_and_missing_snapshot_records(records)
+
+    if final_media_repair and ready_records:
+        print("Running hard media repair before final HTML rewrite...", flush=True)
+        total_jobs, missing_before, repaired_count, missing_after = repair_missing_media_from_snapshot_records(
+            ready_records,
+            asset_dir,
+            workers,
+            x_bearer_token=x_bearer_token,
+            resume=resume,
+            reverse_resume=reverse_resume,
+            verbose=verbose,
+            retry_forbidden_media=final_media_repair_retry_forbidden,
+            retry_forbidden_each_pass=final_media_repair_retry_forbidden,
+            allow_wayback_media_fallback=final_policy.allow_wayback_fallback,
+            media_fetch_policy=final_policy,
+        )
+        print(f"Hard media repair targets: {total_jobs}")
+        print(f"Missing before hard repair: {missing_before}")
+        print(f"Repaired during hard repair: {repaired_count}")
+        print(f"Still missing after hard repair: {missing_after}")
 
     print(f"Finalizing HTML from {len(ready_records)}/{total} available JSON snapshots...", flush=True)
     return build_archives_from_snapshot_records(
@@ -7264,6 +7538,7 @@ def build_archives(
         x_api_reply_chain_use_wayback=x_api_reply_chain_use_wayback,
         verbose=verbose,
         x_api_access_index=x_api_access_index,
+        media_fetch_policy=final_policy,
     )
 
 
@@ -7298,7 +7573,57 @@ def bounded_int(min_value: int, max_value: int):
     return parse
 
 
+def cli_option_was_supplied(argv: List[str], *option_names: str) -> bool:
+    for item in argv:
+        for option_name in option_names:
+            if item == option_name or item.startswith(f"{option_name}="):
+                return True
+    return False
+
+
+def resolve_effort_settings(args: argparse.Namespace) -> EffortSettings:
+    explicit_reply_depth = bool(getattr(args, "x_api_reply_chain_depth_explicit", False))
+    if args.effort_level is None:
+        return EffortSettings(
+            reply_chain_depth=args.x_api_reply_chain_depth,
+            stream_media_policy=MEDIA_FETCH_FULL,
+            final_media_policy=MEDIA_FETCH_FULL,
+            run_final_media_repair=False,
+            retry_forbidden_media_in_repair=args.retry_403,
+        )
+
+    level = args.effort_level
+    reply_chain_depth = (
+        args.x_api_reply_chain_depth
+        if explicit_reply_depth
+        else DEFAULT_EFFORT_REPLY_CHAIN_DEPTH if level >= 1 else 0
+    )
+    if level <= 1:
+        stream_policy = MEDIA_FETCH_NONE
+    else:
+        stream_policy = MEDIA_FETCH_EASY_IMAGES
+    final_policy = MEDIA_FETCH_FULL if level >= 3 else stream_policy
+    return EffortSettings(
+        reply_chain_depth=reply_chain_depth,
+        stream_media_policy=stream_policy,
+        final_media_policy=final_policy,
+        run_final_media_repair=level >= 3,
+        retry_forbidden_media_in_repair=args.retry_403 or level >= 3,
+    )
+
+
+def should_load_x_api_auths(args: argparse.Namespace) -> bool:
+    explicit_reply_depth = bool(getattr(args, "x_api_reply_chain_depth_explicit", False))
+    return (
+        (explicit_reply_depth and args.x_api_reply_chain_depth > 0)
+        or args.repair_reply_chain_depth
+        or args.x_api_timeline
+        or args.x_api_conversations
+    )
+
+
 def parse_args() -> argparse.Namespace:
+    raw_argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
         description="Download archived tweets into JSON and HTML archive bundles.",
     )
@@ -7378,6 +7703,16 @@ def parse_args() -> argparse.Namespace:
         help="Retry media URLs previously cached as HTTP 403 instead of skipping them from the negative cache.",
     )
     parser.add_argument(
+        "--effort-level",
+        type=bounded_int(0, 3),
+        default=None,
+        metavar="0-3",
+        help=(
+            "Beginner preset for the default full run: 0 text only, 1 adds local/Wayback reply chains "
+            f"to depth {DEFAULT_EFFORT_REPLY_CHAIN_DEPTH}, 2 adds easy image media, 3 adds hard media repair."
+        ),
+    )
+    parser.add_argument(
         "--x-api-reply-chain-depth",
         type=non_negative_int,
         default=0,
@@ -7448,8 +7783,18 @@ def parse_args() -> argparse.Namespace:
         help="Load X API credentials from this dotenv file. Repeat to try multiple credential sets in order (default: .env).",
     )
     args = parser.parse_args()
+    args.x_api_reply_chain_depth_explicit = cli_option_was_supplied(raw_argv, "--x-api-reply-chain-depth")
     args.env_files = args.env_file or [".env"]
     args.env_file = args.env_files[0]
+    if args.effort_level is not None and (
+        args.json_only
+        or args.html_from_json
+        or args.repair_media
+        or args.repair_reply_chain_depth
+        or args.x_api_conversations
+        or args.x_api_timeline
+    ):
+        parser.error("--effort-level only applies to the default full run")
     if args.no_any_repair and not args.html_from_json:
         parser.error("--no-any-repair can only be used with --html-from-json")
     if args.no_any_repair and args.no_resume:
@@ -7479,13 +7824,21 @@ def main():
     user = args.twitter_username.lstrip("@").strip()
     resume = not args.no_resume
     output_path, asset_dir, _, json_dir, _ = build_output_paths(user)
+    effort_settings = resolve_effort_settings(args)
     x_api_auths: List[XApiAuth] = []
     x_bearer_token = XApiAuth()
     x_api_access_index = load_x_api_access_index(asset_dir)
 
     if args.reverse_resume:
         print("Resume order is set to newest-first for any remaining work.", flush=True)
-    if args.x_api_reply_chain_depth or args.repair_reply_chain_depth or args.x_api_timeline or args.x_api_conversations:
+    if args.effort_level is not None:
+        print(
+            f"Effort level {args.effort_level} enabled: reply-chain depth {effort_settings.reply_chain_depth}, "
+            f"stream media policy {effort_settings.stream_media_policy.name}, "
+            f"final media policy {effort_settings.final_media_policy.name}.",
+            flush=True,
+        )
+    if should_load_x_api_auths(args):
         x_api_auths = get_x_api_auths_from_env_files(args.env_files, args.x_bearer_token_env)
         if not x_api_auths:
             fallback_auth = get_x_api_auth(args.x_bearer_token_env)
@@ -7771,6 +8124,11 @@ def main():
             return
 
         print(f"Found {len(snapshots)} snapshot records. Resolving JSON and rendering HTML...")
+        stream_media_policy = effort_settings.stream_media_policy
+        final_media_policy = effort_settings.final_media_policy
+        if args.effort_level is not None and args.x_api_only:
+            stream_media_policy = replace(stream_media_policy, allow_wayback_fallback=False)
+            final_media_policy = replace(final_media_policy, allow_wayback_fallback=False)
         written_paths = build_archives(
             snapshots,
             user,
@@ -7780,11 +8138,15 @@ def main():
             resume=resume,
             reverse_resume=args.reverse_resume,
             x_bearer_token=x_bearer_token,
-            x_api_reply_chain_depth=args.x_api_reply_chain_depth,
+            x_api_reply_chain_depth=effort_settings.reply_chain_depth,
             x_api_reply_chain_use_wayback=not args.x_api_only,
             verbose=args.verbose,
             retry_forbidden_media=args.retry_403,
             x_api_access_index=x_api_access_index,
+            media_fetch_policy=stream_media_policy,
+            final_media_fetch_policy=final_media_policy,
+            final_media_repair=effort_settings.run_final_media_repair,
+            final_media_repair_retry_forbidden=effort_settings.retry_forbidden_media_in_repair,
         )
         if args.x_api_reply_chain_depth:
             write_x_api_access_index(asset_dir, x_api_access_index)

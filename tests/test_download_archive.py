@@ -45,15 +45,71 @@ class NoteTweetExtractionTests(unittest.TestCase):
 
         self.assertTrue(args.no_any_repair)
 
-    def test_reply_tab_preserves_current_html_sort_order(self):
-        script = download_archive.ARCHIVE_FILTER_JS
-        reply_sort_start = script.index('if (name !== "replies")')
-        reply_sort_end = script.index("ordered.forEach", reply_sort_start)
-        reply_sort_block = script[reply_sort_start:reply_sort_end]
+    def test_parse_args_accepts_effort_level_for_default_run(self):
+        with mock.patch(
+            "download_archive.sys.argv",
+            ["download_archive.py", "account", "--effort-level", "2"],
+        ):
+            args = download_archive.parse_args()
 
-        self.assertIn("if (aVisible !== bVisible) return bVisible - aVisible;", reply_sort_block)
-        self.assertIn("return originalOrder.get(a) - originalOrder.get(b);", reply_sort_block)
-        self.assertNotIn("getReplyViewSortTime", reply_sort_block)
+        self.assertEqual(args.effort_level, 2)
+        self.assertFalse(args.x_api_reply_chain_depth_explicit)
+
+    def test_parse_args_rejects_effort_level_with_html_from_json(self):
+        with mock.patch(
+            "download_archive.sys.argv",
+            ["download_archive.py", "account", "--html-from-json", "--effort-level", "2"],
+        ):
+            with self.assertRaises(SystemExit):
+                download_archive.parse_args()
+
+    def test_resolve_effort_level_two_uses_easy_media_without_x_api_depth(self):
+        with mock.patch(
+            "download_archive.sys.argv",
+            ["download_archive.py", "account", "--effort-level", "2"],
+        ):
+            args = download_archive.parse_args()
+
+        settings = download_archive.resolve_effort_settings(args)
+
+        self.assertEqual(settings.reply_chain_depth, 8)
+        self.assertEqual(settings.stream_media_policy.name, "easy_image")
+        self.assertFalse(download_archive.should_load_x_api_auths(args))
+
+    def test_resolve_effort_explicit_x_api_depth_overrides_preset_and_loads_auth(self):
+        with mock.patch(
+            "download_archive.sys.argv",
+            ["download_archive.py", "account", "--effort-level", "2", "--x-api-reply-chain-depth", "3"],
+        ):
+            args = download_archive.parse_args()
+
+        settings = download_archive.resolve_effort_settings(args)
+
+        self.assertEqual(settings.reply_chain_depth, 3)
+        self.assertTrue(args.x_api_reply_chain_depth_explicit)
+        self.assertTrue(download_archive.should_load_x_api_auths(args))
+
+    def test_resolve_effort_level_three_runs_hard_final_repair(self):
+        with mock.patch(
+            "download_archive.sys.argv",
+            ["download_archive.py", "account", "--effort-level", "3"],
+        ):
+            args = download_archive.parse_args()
+
+        settings = download_archive.resolve_effort_settings(args)
+
+        self.assertTrue(settings.run_final_media_repair)
+        self.assertEqual(settings.stream_media_policy.name, "easy_image")
+        self.assertEqual(settings.final_media_policy.name, "full")
+        self.assertTrue(settings.retry_forbidden_media_in_repair)
+
+    def test_reply_tab_uses_existing_html_order_without_dom_reordering(self):
+        script = download_archive.ARCHIVE_FILTER_JS
+
+        self.assertNotIn("appendChild(tweet)", script)
+        self.assertIn('t.dataset.hasComments === "true"', script)
+        self.assertIn('t.dataset.isComment !== "true"', script)
+        self.assertNotIn("getReplyViewSortTime", script)
 
     def test_parse_args_rejects_no_any_repair_with_x_api_reply_chain_depth(self):
         with mock.patch(
@@ -755,13 +811,14 @@ class NoteTweetExtractionTests(unittest.TestCase):
 
         updated = download_archive.attach_local_comment_sections([parent, child])
 
-        self.assertIn("tweet-comments", updated[0].block)
-        self.assertIn("data-comment-total='1'", updated[0].block)
-        latest_ts = int(download_archive.datetime(2026, 1, 2, tzinfo=download_archive.timezone.utc).timestamp())
-        self.assertIn(f"data-comment-latest-ts='{latest_ts}'", updated[0].block)
-        self.assertIn("tweet-comment-node", updated[0].block)
+        self.assertNotIn("tweet-comments", updated[0].block)
         self.assertIn("展开评论 (1)", updated[0].block)
-        self.assertIn("<p>child</p>", updated[0].block)
+        self.assertIn("data-comment-total='1'", updated[0].deferred_comments_html)
+        latest_ts = int(download_archive.datetime(2026, 1, 2, tzinfo=download_archive.timezone.utc).timestamp())
+        self.assertEqual(updated[0].deferred_comment_latest_ts, latest_ts)
+        self.assertIn(f"data-comment-latest-ts='{latest_ts}'", updated[0].deferred_comments_html)
+        self.assertIn("tweet-comment-node", updated[0].deferred_comments_html)
+        self.assertIn("<p>child</p>", updated[0].deferred_comments_html)
         self.assertNotIn("pale-fire-comments:100", updated[0].block)
         self.assertNotIn("tweet-comments", updated[1].block)
 
@@ -819,10 +876,14 @@ class NoteTweetExtractionTests(unittest.TestCase):
         updated = download_archive.attach_local_comment_sections([root, child, grandchild])
 
         root_block = updated[0].block
-        self.assertIn("data-comment-total='2'", root_block)
         self.assertIn("展开评论 (2)", root_block)
-        self.assertIn("tweet-comment-children", root_block)
-        self.assertLess(root_block.index("<p>child</p>"), root_block.index("<p>grandchild</p>"))
+        self.assertIn("data-comment-total='2'", updated[0].deferred_comments_html)
+        self.assertEqual(updated[0].deferred_comment_count, 2)
+        self.assertIn("tweet-comment-children", updated[0].deferred_comments_html)
+        self.assertLess(
+            updated[0].deferred_comments_html.index("<p>child</p>"),
+            updated[0].deferred_comments_html.index("<p>grandchild</p>"),
+        )
         self.assertNotIn("pale-fire-comments:100", root_block)
 
     def test_attach_local_comment_sections_injects_reply_chain_parent_comments(self):
@@ -878,12 +939,15 @@ class NoteTweetExtractionTests(unittest.TestCase):
         updated = download_archive.attach_local_comment_sections([root, author_reply])
 
         root_block = updated[0].block
-        self.assertIn("data-comment-total='2'", root_block)
         self.assertIn("展开评论 (2)", root_block)
-        self.assertIn("<p>reader comment</p>", root_block)
-        self.assertIn("<p>author reply</p>", root_block)
-        self.assertLess(root_block.index("<p>reader comment</p>"), root_block.index("<p>author reply</p>"))
-        self.assertIn("tweet-comment-children", root_block)
+        self.assertIn("data-comment-total='2'", updated[0].deferred_comments_html)
+        self.assertIn("<p>reader comment</p>", updated[0].deferred_comments_html)
+        self.assertIn("<p>author reply</p>", updated[0].deferred_comments_html)
+        self.assertLess(
+            updated[0].deferred_comments_html.index("<p>reader comment</p>"),
+            updated[0].deferred_comments_html.index("<p>author reply</p>"),
+        )
+        self.assertIn("tweet-comment-children", updated[0].deferred_comments_html)
 
     def test_attach_local_comment_sections_falls_back_to_conversation_root(self):
         root = download_archive.ArchiveEntry(
@@ -921,9 +985,9 @@ class NoteTweetExtractionTests(unittest.TestCase):
 
         updated = download_archive.attach_local_comment_sections([root, nested_reply])
 
-        self.assertIn("tweet-comments", updated[0].block)
         self.assertIn("展开评论 (1)", updated[0].block)
-        self.assertIn("<p>nested</p>", updated[0].block)
+        self.assertIn("tweet-comments", updated[0].deferred_comments_html)
+        self.assertIn("<p>nested</p>", updated[0].deferred_comments_html)
 
     def test_fetch_reply_chain_uses_oauth1_user_context_before_bearer(self):
         class FakeResponse:
@@ -2734,6 +2798,107 @@ class NoteTweetExtractionTests(unittest.TestCase):
         self.assertTrue(requested_urls)
         self.assertTrue(all("web.archive.org" not in url for url in requested_urls))
 
+    def test_easy_image_download_does_not_query_closest_cdx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp)
+            media_dir = asset_dir / "media"
+            media_dir.mkdir()
+            media_url = "https://pbs.twimg.com/media/easy.jpg"
+
+            with mock.patch.object(
+                download_archive,
+                "build_image_candidate_urls",
+                return_value=[f"https://web.archive.org/web/20260101000000im_/{media_url}"],
+            ):
+                with mock.patch.object(download_archive, "build_closest_capture_candidate_urls") as closest_lookup:
+                    with mock.patch.object(download_archive, "media_cdx_has_any_capture") as exists_lookup:
+                        with mock.patch.object(download_archive, "get_with_retry", side_effect=RuntimeError("timeout")):
+                            result = download_archive.download_image_asset(
+                                media_url,
+                                "20260101000000",
+                                media_dir,
+                                asset_dir.name,
+                                cache={},
+                                negative_cache={},
+                                allow_closest_cdx_lookup=False,
+                            )
+
+        self.assertEqual(result, "")
+        closest_lookup.assert_not_called()
+        exists_lookup.assert_not_called()
+
+    def test_easy_media_policy_does_not_actively_download_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp)
+            media_dir = asset_dir / "media"
+            media_dir.mkdir()
+            video_url = "https://video.twimg.com/ext_tw_video/video.mp4"
+
+            with mock.patch.object(download_archive, "get_with_retry") as get_with_retry:
+                result = download_archive.download_video_asset(
+                    video_url,
+                    "20260101000000",
+                    media_dir,
+                    asset_dir.name,
+                    cache={},
+                    negative_cache={},
+                    download_missing=download_archive.MEDIA_FETCH_EASY_IMAGES.should_download_kind("video"),
+                )
+
+        self.assertEqual(result, "")
+        get_with_retry.assert_not_called()
+
+    def test_no_media_policy_prefetch_does_not_lookup_reference_media(self):
+        data = {
+            "data": {
+                "id": "300",
+                "author_id": "u3",
+                "conversation_id": "200",
+                "created_at": "2026-01-03T00:00:00.000Z",
+                "referenced_tweets": [{"type": "replied_to", "id": "200"}],
+                "text": "@parent_user child text",
+            },
+            "includes": {
+                "users": [{"id": "u3", "username": "child_user", "name": "Child"}],
+                "tweets": [
+                    {
+                        "id": "200",
+                        "author_id": "u2",
+                        "conversation_id": "200",
+                        "created_at": "2026-01-02T00:00:00.000Z",
+                        "attachments": {"media_keys": ["3_200"]},
+                        "text": "parent with photo https://t.co/photo",
+                    }
+                ],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp) / "archive_assets"
+            json_dir = asset_dir / "json"
+            media_dir = asset_dir / "media"
+            json_dir.mkdir(parents=True)
+            media_dir.mkdir(parents=True)
+            json_path = json_dir / "20260103000000_300.json"
+            json_path.write_text(json.dumps(data), encoding="utf-8")
+            record = download_archive.SnapshotRecord(
+                timestamp="20260103000000",
+                original_url="https://twitter.com/child_user/status/300",
+                json_path=json_path,
+            )
+
+            with mock.patch.object(download_archive, "fetch_wayback_tweet_payload") as wayback_fetch:
+                download_archive.prefetch_snapshot_media(
+                    record,
+                    asset_dir.name,
+                    media_dir,
+                    image_cache={},
+                    negative_cache={},
+                    media_fetch_policy=download_archive.MEDIA_FETCH_NONE,
+                )
+
+        wayback_fetch.assert_not_called()
+
     def test_forbidden_media_tries_candidates_then_marks_negative_cache_as_403(self):
         with tempfile.TemporaryDirectory() as tmp:
             asset_dir = Path(tmp)
@@ -3008,7 +3173,8 @@ class NoteTweetExtractionTests(unittest.TestCase):
 
         self.assertIsNotNone(entry)
         assert entry is not None
-        self.assertIn("[图片媒体不可用]", entry.block)
+        self.assertIn("tweet-reply-chain", entry.block)
+        self.assertIn("[图片媒体不可用]", entry.deferred_reply_chain_html)
         self.assertEqual(len(entry.comment_parent_entries), 1)
         parent_entry = entry.comment_parent_entries[0]
         self.assertIn("[图片媒体不可用]", parent_entry.comment_html)

@@ -49,6 +49,15 @@ Regenerate HTML from local JSON snapshots without any network-backed repair:
 python download_archive.py <twitter_username> --html-from-json --no-any-repair
 ```
 
+Use a beginner effort preset for the default full run:
+
+```bash
+python download_archive.py <twitter_username> --effort-level 0  # text/JSON only
+python download_archive.py <twitter_username> --effort-level 1  # plus local/Wayback reply chains to depth 8
+python download_archive.py <twitter_username> --effort-level 2  # plus easy image media
+python download_archive.py <twitter_username> --effort-level 3  # plus hard media repair
+```
+
 Repair only missing local media assets from existing JSON snapshots:
 
 ```bash
@@ -153,6 +162,8 @@ python download_archive.py AnIncandescence
 python download_archive.py AnIncandescence --json-only --workers 24
 python download_archive.py AnIncandescence --json-only --reverse-resume
 python download_archive.py AnIncandescence --html-from-json
+python download_archive.py AnIncandescence --effort-level 2
+python download_archive.py AnIncandescence --effort-level 3
 python download_archive.py AnIncandescence --html-from-json --x-api-reply-chain-depth 8
 python download_archive.py AnIncandescence --x-api-timeline --x-api-timeline-pages 0 --env-file ./.env
 python download_archive.py AnIncandescence --x-api-conversations --x-api-conversation-search all --env-file ./.env
@@ -234,6 +245,8 @@ The downloader also writes:
 - `--reverse-resume` changes resume-time processing priority to newest-first for any remaining JSON/media work, but does not change the final HTML output order.
 - Missing JSON snapshots are retried automatically across multiple passes in each run before the final HTML pages are finalized.
 - In the default full run, tweet media is prefetched alongside snapshot JSON preparation so the streaming chronological HTML page is not waiting on media downloads at finalize time.
+- `--effort-level 0..3` is a beginner preset for the default full run only. Level `0` fetches JSON/text and renders streamed HTML without actively downloading missing media. Level `1` also repairs reply-chain context to depth 8 through local JSON and Wayback, but does not automatically enable X API. Level `2` also downloads easy image media in one pass using original URLs and same-timestamp Wayback URLs, without video or CDX closest-capture lookups. Level `3` keeps the streamed preview, then runs hard media repair before rewriting the final HTML outputs; hard repair includes video, CDX closest-capture lookups, and repeated 403 retries while 404/410 remain hard misses.
+- X API remains an advanced opt-in path. Combine `--effort-level` with explicit X API flags such as `--x-api-reply-chain-depth N` and `--env-file` when you want API-backed lookup; explicit advanced flags override the effort preset.
 - `--json-only` stops after the JSON stage and does not write HTML files.
 - `--html-from-json` skips snapshot JSON fetching and rebuilds the HTML pages from the local `<username>_archive/*_archive_assets/json/` directory.
 - `--html-from-json --no-any-repair` rebuilds HTML from local JSON without network-backed repair or lookup. It does not fetch missing media, X API reply-chain data, or Wayback fallback payloads; only local JSON and already cached local media files are used. The older `--no-media-repair` spelling is still accepted as a compatibility alias.
