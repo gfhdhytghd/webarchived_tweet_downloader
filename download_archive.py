@@ -72,7 +72,7 @@ import re
 import threading
 import time
 import fcntl
-from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
@@ -344,18 +344,19 @@ ARCHIVE_FILTER_JS = """
   setupDetailPanel();
 
   function setupArchiveTabs(tweets, container) {
-    const tabKey = `${getArchiveStorageNamespace()}-archive-tab`;
+    const tabKey = `${getArchiveStorageNamespace()}-archive-tab-v2`;
     const posts = tweets.filter((t) => t.dataset.isReply !== "true");
     const replyTweets = tweets.filter((t) => t.dataset.isReply === "true");
     const threadRoots = tweets.filter((t) => t.dataset.hasComments === "true" && t.dataset.isComment !== "true");
-    const orphanReplies = replyTweets.filter((t) => t.dataset.isComment !== "true");
-    const replyViewTweets = new Set([...threadRoots, ...orphanReplies]);
+    const replyViewTweets = new Set([...threadRoots, ...replyTweets]);
     if (!replyTweets.length && !threadRoots.length) return;
 
     const tabBar = document.createElement("div");
     tabBar.className = "archive-tabs";
     tabBar.innerHTML =
-      `<button class="archive-tab active" data-archive-tab="posts">` +
+      `<button class="archive-tab active" data-archive-tab="all">` +
+      `\u5168\u90e8<span class="archive-tab-meta">${tweets.length}</span></button>` +
+    `<button class="archive-tab" data-archive-tab="posts">` +
       `\u5e16\u5b50<span class="archive-tab-meta">${posts.length}</span></button>` +
     `<button class="archive-tab" data-archive-tab="replies">` +
       `\u56de\u590d<span class="archive-tab-meta">${replyTweets.length}</span></button>`;
@@ -363,11 +364,11 @@ ARCHIVE_FILTER_JS = """
     container.appendChild(tabBar);
 
     const tabButtons = Array.from(tabBar.querySelectorAll(".archive-tab"));
-    const scrollPositions = { posts: 0, replies: 0 };
-    let currentTab = "posts";
+    const scrollPositions = { all: 0, posts: 0, replies: 0 };
+    let currentTab = "all";
 
     const saved = readTabState(tabKey);
-    if (saved && saved !== "posts") {
+    if (saved && saved !== "all") {
       activateTab(saved, true);
     }
 
@@ -390,12 +391,13 @@ ARCHIVE_FILTER_JS = """
     }
 
     function tabAllowsTweet(tweet, name) {
+      if (name === "all") return true;
       if (name === "posts") return tweet.dataset.isReply !== "true";
       return replyViewTweets.has(tweet);
     }
 
     function readTabState(key) {
-      try { return window.localStorage.getItem(key) || "posts"; } catch { return "posts"; }
+      try { return window.localStorage.getItem(key) || "all"; } catch { return "all"; }
     }
     function writeTabState(key, value) {
       try { window.localStorage.setItem(key, value); } catch {}
@@ -404,7 +406,7 @@ ARCHIVE_FILTER_JS = """
     // Expose for coordination with filters
     window._archiveActiveTab = () => {
       const active = tabBar.querySelector(".archive-tab.active");
-      return active ? active.dataset.archiveTab : "posts";
+      return active ? active.dataset.archiveTab : "all";
     };
     window._archiveTabAllowsTweet = tabAllowsTweet;
     window._archiveRefreshTab = () => {
@@ -1286,10 +1288,17 @@ def ensure_asset_directories(asset_dir: Path) -> None:
     (asset_dir / "json").mkdir(parents=True, exist_ok=True)
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def ensure_static_files(asset_dir: Path) -> None:
     ensure_asset_directories(asset_dir)
-    (asset_dir / "archive.css").write_text(ARCHIVE_CSS + "\n" + ARCHIVE_FILTER_CSS, encoding="utf-8")
-    (asset_dir / "archive.js").write_text(ARCHIVE_FILTER_JS + "\n" + ARCHIVE_JS, encoding="utf-8")
+    write_text_atomic(asset_dir / "archive.css", ARCHIVE_CSS + "\n" + ARCHIVE_FILTER_CSS)
+    write_text_atomic(asset_dir / "archive.js", ARCHIVE_FILTER_JS + "\n" + ARCHIVE_JS)
 
 
 def build_output_paths(user: str) -> Tuple[Path, Path, Path, Path, str]:
@@ -1325,7 +1334,14 @@ def media_index_lock_path(asset_dir: Path) -> Path:
 def locked_media_index(asset_dir: Path):
     lock_path = media_index_lock_path(asset_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
+    try:
+        lock_file = lock_path.open("a+", encoding="utf-8")
+    except PermissionError:
+        replacement_path = lock_path.with_name(f"{lock_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        replacement_path.write_text("", encoding="utf-8")
+        replacement_path.replace(lock_path)
+        lock_file = lock_path.open("a+", encoding="utf-8")
+    with lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -4945,6 +4961,64 @@ def mark_negative_media_cache_entry(
     persist_negative_media_cache_entry(media_dir, negative_cache)
 
 
+def resolve_existing_local_media_asset_path(media_url: str, media_dir: Path, asset_dir_name: str) -> str:
+    """
+    Return the archive-relative path for a media URL that already points at a
+    file in this archive's media directory.
+    """
+    raw_url = _coerce_string(media_url).strip()
+    if not raw_url:
+        return ""
+
+    candidates: List[Path] = []
+    expected_prefix = f"{asset_dir_name}/media/"
+    if raw_url.startswith(expected_prefix):
+        candidates.append(media_dir / raw_url[len(expected_prefix):])
+
+    parsed = urlparse(raw_url)
+    if parsed.scheme and parsed.scheme != "file":
+        return ""
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc != "localhost":
+            return ""
+        path_text = unquote(parsed.path)
+    else:
+        path_text = raw_url
+
+    if path_text:
+        path = Path(path_text)
+        if path.is_absolute():
+            candidates.append(path)
+        if path.name:
+            candidates.append(media_dir / path.name)
+
+    try:
+        media_root = media_dir.resolve()
+    except OSError:
+        media_root = media_dir
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            relative_to_media = resolved.relative_to(media_root)
+        except ValueError:
+            continue
+        try:
+            if not resolved.is_file():
+                continue
+        except OSError:
+            continue
+        return f"{asset_dir_name}/media/{relative_to_media.as_posix()}"
+    return ""
+
+
 def download_image_asset(
     image_url: str,
     snapshot_timestamp: str,
@@ -4968,6 +5042,15 @@ def download_image_asset(
             if (media_dir / Path(cached_relative_path).name).exists():
                 return cached_relative_path
             cache.pop(image_url, None)
+        local_relative_path = resolve_existing_local_media_asset_path(image_url, media_dir, asset_dir_name)
+        if local_relative_path:
+            if cache is not None:
+                cache[image_url] = local_relative_path
+                persist_media_cache_entry(media_dir, cache)
+            if negative_cache is not None and image_url in negative_cache:
+                negative_cache.pop(image_url, None)
+                persist_negative_media_cache_entry(media_dir, negative_cache)
+            return local_relative_path
         if negative_cache is not None and image_url in negative_cache:
             negative_status = get_negative_media_status(negative_cache, image_url)
             if retry_forbidden_media and negative_status == "403":
@@ -5101,6 +5184,15 @@ def download_video_asset(
             if (media_dir / Path(cached_relative_path).name).exists():
                 return cached_relative_path
             cache.pop(video_url, None)
+        local_relative_path = resolve_existing_local_media_asset_path(video_url, media_dir, asset_dir_name)
+        if local_relative_path:
+            if cache is not None:
+                cache[video_url] = local_relative_path
+                persist_media_cache_entry(media_dir, cache)
+            if negative_cache is not None and video_url in negative_cache:
+                negative_cache.pop(video_url, None)
+                persist_negative_media_cache_entry(media_dir, negative_cache)
+            return local_relative_path
         if negative_cache is not None and video_url in negative_cache:
             negative_status = get_negative_media_status(negative_cache, video_url)
             if retry_forbidden_media and negative_status == "403":
@@ -6795,7 +6887,7 @@ def render_index_document(user: str, total: int, output_path: Path) -> str:
 
 def write_index_html(user: str, total: int, output_path: Path) -> Path:
     index_path = output_path.with_name("index.html")
-    index_path.write_text(render_index_document(user, total, output_path), encoding="utf-8")
+    write_text_atomic(index_path, render_index_document(user, total, output_path))
     return index_path
 
 
@@ -6947,11 +7039,13 @@ def write_archive_html(
     profile: Optional[UserProfile] = None,
     avatar_path: str = "",
 ) -> None:
-    with output_path.open("w", encoding="utf-8") as f:
+    tmp_path = output_path.with_name(f"{output_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
         f.write(render_document_start(user, len(entries), asset_dir_name, title_suffix, profile=profile, avatar_path=avatar_path))
         for entry in entries:
             f.write(entry.block)
         f.write(render_document_end(asset_dir_name, render_deferred_archive_data(entries)))
+    tmp_path.replace(output_path)
 
 
 def get_archive_output_jobs(output_path: Path) -> List[Tuple[str, str, Path]]:

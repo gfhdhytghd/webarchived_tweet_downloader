@@ -107,8 +107,9 @@ class NoteTweetExtractionTests(unittest.TestCase):
         script = download_archive.ARCHIVE_FILTER_JS
 
         self.assertNotIn("appendChild(tweet)", script)
+        self.assertIn('data-archive-tab="all"', script)
         self.assertIn('t.dataset.hasComments === "true"', script)
-        self.assertIn('t.dataset.isComment !== "true"', script)
+        self.assertIn("...replyTweets", script)
         self.assertNotIn("getReplyViewSortTime", script)
 
     def test_parse_args_rejects_no_any_repair_with_x_api_reply_chain_depth(self):
@@ -2797,6 +2798,32 @@ class NoteTweetExtractionTests(unittest.TestCase):
         requested_urls = [call.args[0] for call in get_with_retry.call_args_list]
         self.assertTrue(requested_urls)
         self.assertTrue(all("web.archive.org" not in url for url in requested_urls))
+
+    def test_download_image_asset_uses_existing_local_media_when_downloads_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_dir = Path(tmp) / "Account_archive_assets"
+            media_dir = asset_dir / "media"
+            media_dir.mkdir(parents=True)
+            image_path = media_dir / "100-local.jpg"
+            image_path.write_bytes(b"already local")
+            cache = {}
+            negative_cache = {str(image_path): {"status": "404", "reason": "hard-missing"}}
+
+            with mock.patch.object(download_archive, "get_with_retry") as get_with_retry:
+                result = download_archive.download_image_asset(
+                    str(image_path),
+                    "20260101000000",
+                    media_dir,
+                    asset_dir.name,
+                    cache=cache,
+                    negative_cache=negative_cache,
+                    download_missing=False,
+                )
+
+        self.assertEqual(result, f"{asset_dir.name}/media/{image_path.name}")
+        self.assertEqual(cache[str(image_path)], result)
+        self.assertNotIn(str(image_path), negative_cache)
+        get_with_retry.assert_not_called()
 
     def test_easy_image_download_does_not_query_closest_cdx(self):
         with tempfile.TemporaryDirectory() as tmp:
